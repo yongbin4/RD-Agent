@@ -120,6 +120,28 @@ class DataScienceRDLoop(RDLoop):
         self.pipeline_coder = PipelineCoSTEER(scen)
 
         self.runner = DSCoSTEERRunner(scen)
+
+        # Initialize global knowledge base (skill learning - always enabled)
+        from rdagent.components.skill_learning.global_kb import GlobalKnowledgeBase
+        from rdagent.components.skill_learning.extractor import SkillExtractor
+
+        self.competition_name = PROP_SETTING.competition
+        self.global_kb = GlobalKnowledgeBase()
+        self.skill_extractor = SkillExtractor()
+
+        # Load all skills on startup
+        self.global_kb.load_all_skills()
+        stats = self.global_kb.get_statistics()
+        logger.info(f"📚 Global Knowledge Base initialized:")
+        logger.info(f"  - {stats['total_skills']} skills loaded")
+        logger.info(f"  - {stats['total_competitions']} competitions in history")
+        logger.info(f"  - {stats['average_skill_success_rate']:.1%} average skill success rate")
+
+        # Pass global KB to all coders
+        for coder in [self.data_loader_coder, self.feature_coder, self.model_coder,
+                      self.ensemble_coder, self.workflow_coder, self.pipeline_coder]:
+            coder.global_kb = self.global_kb
+            coder.competition_name = self.competition_name
         if DS_RD_SETTING.enable_doc_dev:
             self.docdev = DocDev(scen)
 
@@ -131,9 +153,72 @@ class DataScienceRDLoop(RDLoop):
         else:
             self.trace = DSTrace(scen=scen)
 
+        # Auto-resume from SOTA if available
+        from rdagent.components.experiment_learning.initializer import initialize_trace_from_sota, should_resume_from_sota
+
+        if should_resume_from_sota(self.competition_name, self.global_kb):
+            # Initialize trace with SOTA experiments
+            self.trace = initialize_trace_from_sota(
+                competition_name=self.competition_name,
+                global_kb=self.global_kb,
+                base_trace=self.trace,
+                top_k=3
+            )
+            logger.info(f"🚀 Competition will build upon existing SOTA")
+
         self.summarizer = import_class(PROP_SETTING.summarizer)(scen=scen, **PROP_SETTING.summarizer_init_kwargs)
 
         super(RDLoop, self).__init__()
+
+    def _should_extract_skill_from_score(self, score: Optional[float]) -> tuple[bool, str]:
+        """
+        Determine if skill should be extracted based on relative score quality.
+
+        For metrics where lower is better (like Log Loss):
+        - Extract if score is in the top X% (lowest X%)
+        - Bootstrap: always extract during first few experiments
+
+        Args:
+            score: The score of the current experiment (or None)
+
+        Returns:
+            (should_extract: bool, reason: str)
+        """
+        import numpy as np
+
+        # Edge case: Score is None - skip
+        if score is None:
+            return False, "Score is None"
+
+        # Get recent successful experiment scores from trace history
+        recent_scores = []
+        for exp, fb in self.trace.hist:
+            if hasattr(fb, 'decision') and fb.decision and hasattr(fb, 'score'):
+                try:
+                    exp_score = float(fb.score)
+                    if not np.isnan(exp_score) and not np.isinf(exp_score):
+                        recent_scores.append(exp_score)
+                except (ValueError, TypeError):
+                    continue
+
+        # Bootstrap phase: not enough samples yet - always extract
+        min_samples = DS_RD_SETTING.skill_extraction_min_samples
+        if len(recent_scores) < min_samples:
+            return True, f"Bootstrapping: only {len(recent_scores)} samples (need {min_samples})"
+
+        # Calculate percentile cutoff for "lower is better" metrics
+        percentile_threshold = DS_RD_SETTING.skill_extraction_percentile
+        cutoff = np.percentile(recent_scores, percentile_threshold)
+
+        # Lower scores are better, so extract if score <= cutoff
+        should_extract = score <= cutoff
+
+        reason = (
+            f"Score {score:.4f} {'<=' if should_extract else '>'} "
+            f"cutoff {cutoff:.4f} (top {percentile_threshold}% of {len(recent_scores)} samples)"
+        )
+
+        return should_extract, reason
 
     async def direct_exp_gen(self, prev_out: dict[str, Any]):
 
@@ -224,6 +309,60 @@ class DataScienceRDLoop(RDLoop):
             if exp.local_selection is not None:
                 self.trace.set_current_selection(exp.local_selection)
             self.trace.sync_dag_parent_and_hist((exp, prev_out["feedback"]), cur_loop_id)
+
+            # Skill learning: Extract skills from successful experiments
+            feedback = prev_out["feedback"]
+            if hasattr(self, 'global_kb') and hasattr(feedback, 'decision') and feedback.decision:
+                # Convert score from string to float (feedback.score is a string in DSRunnerFeedback)
+                score_raw = getattr(feedback, 'score', None)
+                score = None
+                if score_raw is not None:
+                    try:
+                        score = float(score_raw)
+                    except (ValueError, TypeError):
+                        logger.warning(f"Could not convert score to float: {score_raw}")
+                        score = None
+
+                # Check if we should extract skills based on relative score quality
+                should_extract, reason = self._should_extract_skill_from_score(score)
+
+                if should_extract:
+                    logger.info(f"📊 Skill extraction triggered: {reason}")
+                    try:
+                        skills = self.skill_extractor.extract_from_experiment(
+                            experiment=exp,
+                            feedback=feedback,
+                            competition_context=self.competition_name
+                        )
+                        for skill in skills:
+                            self.global_kb.add_or_update_skill(skill)
+                            logger.info(f"💡 Learned new skill: {skill.name}")
+                    except Exception as e:
+                        logger.error(f"Error extracting skills: {e}")
+                else:
+                    logger.debug(f"⏭️  Skipping skill extraction: {reason}")
+
+                # Update SOTA if this is better than current best
+                # For metrics like Log Loss where lower is better, we compare appropriately
+                if score is not None:
+                    try:
+                        current_best = self.global_kb.get_best_score(self.competition_name)
+                        is_better = current_best is None or score < current_best  # Lower is better for Log Loss
+
+                        if is_better:
+                            from rdagent.components.experiment_learning.sota import SOTAModel
+                            # Determine rank (lower score = better rank)
+                            existing_sota = self.global_kb.get_sota(self.competition_name, top_k=3)
+                            rank = len([s for s in existing_sota if s.score <= score]) + 1
+                            rank = min(rank, 3)  # Keep only top 3
+
+                            sota = SOTAModel.from_experiment(exp, feedback, rank=rank)
+                            sota.competition = self.competition_name
+                            self.global_kb.save_sota(self.competition_name, sota)
+                            logger.info(f"🏆 New SOTA for {self.competition_name}: rank {rank}, score {score:.6f}")
+                    except Exception as e:
+                        logger.error(f"Error saving SOTA: {e}")
+
         else:
             exp: DSExperiment = prev_out["direct_exp_gen"] if isinstance(e, CoderError) else prev_out["coding"]
             # TODO: distinguish timeout error & other exception.
