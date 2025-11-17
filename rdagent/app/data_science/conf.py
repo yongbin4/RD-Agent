@@ -80,6 +80,22 @@ class DataScienceBasePropSetting(KaggleBasePropSetting):
     knowledge_base_path: str | None = None
     idea_pool_json_path: str | None = None
 
+    ### skill learning (always enabled, these are tuning parameters)
+    skill_extraction_percentile: int = 30
+    """Extract skills from top X% of successful experiments (lower scores = better for Log Loss). Default 30 = top 30%"""
+
+    skill_extraction_min_samples: int = 5
+    """Minimum successful experiments before applying percentile filtering (bootstrap phase)"""
+
+    max_skills_per_prompt: int = 3
+    """Maximum number of skills to include in code generation prompts"""
+
+    min_skill_success_rate: float = 0.3
+    """Minimum success rate for a skill to be considered for use"""
+
+    sota_models_to_keep: int = 3
+    """Number of top SOTA models to keep per competition"""
+
     ### archive log folder after each loop
     enable_log_archive: bool = True
     log_archive_path: str | None = None

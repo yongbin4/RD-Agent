@@ -86,6 +86,27 @@ class MultiProcessEvolvingStrategy(EvolvingStrategy):
             last_feedback = evolving_trace[-1].feedback
             assert isinstance(last_feedback, CoSTEERMultiFeedback)
 
+        # Query relevant skills from global knowledge base (if available)
+        if hasattr(self, 'global_kb') and hasattr(self, 'competition_name'):
+            try:
+                # Query skills for each task
+                for task in evo.sub_tasks:
+                    relevant_skills = self.global_kb.query_skills(task, top_k=3)
+                    if not hasattr(queried_knowledge, 'relevant_skills'):
+                        queried_knowledge.relevant_skills = {}
+                    task_info = task.get_task_information()
+                    queried_knowledge.relevant_skills[task_info] = relevant_skills
+
+                # Also get SOTA code
+                sota_models = self.global_kb.get_sota(self.competition_name, top_k=1)
+                if sota_models:
+                    queried_knowledge.sota_code = sota_models[0].code_files
+                else:
+                    queried_knowledge.sota_code = None
+            except Exception as e:
+                from rdagent.log import rdagent_logger
+                rdagent_logger.error(f"Error querying skills: {e}")
+
         # 1.找出需要evolve的task
         to_be_finished_task_index: list[int] = []
         for index, target_task in enumerate(evo.sub_tasks):
