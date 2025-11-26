@@ -4,6 +4,7 @@ from typing import List, Dict, Optional
 import logging
 
 from rdagent.components.skill_learning.skill import Skill
+from rdagent.components.skill_learning.debug_skill import DebugSkill
 from rdagent.components.experiment_learning.sota import SOTAModel
 
 logger = logging.getLogger(__name__)
@@ -16,22 +17,26 @@ class SkillAwarePromptBuilder:
         self,
         original_prompt: str,
         relevant_skills: List[Skill] = None,
+        debug_skills: List[DebugSkill] = None,
         sota_code: Optional[Dict[str, str]] = None,
-        max_skills: int = 3
+        max_skills: int = 3,
+        max_debug_skills: int = 2
     ) -> str:
         """
-        Enhance the original prompt with skills and SOTA code.
+        Enhance the original prompt with skills, debug skills, and SOTA code.
 
         Args:
             original_prompt: The base prompt
-            relevant_skills: List of relevant skills
+            relevant_skills: List of relevant success-based skills
+            debug_skills: List of relevant debugging/problem-solving skills
             sota_code: Dict of SOTA code files (filename -> code)
-            max_skills: Maximum number of skills to include
+            max_skills: Maximum number of success skills to include
+            max_debug_skills: Maximum number of debug skills to include
 
         Returns:
             Enhanced prompt string
         """
-        if not relevant_skills and not sota_code:
+        if not relevant_skills and not debug_skills and not sota_code:
             # Nothing to add
             return original_prompt
 
@@ -46,16 +51,24 @@ class SkillAwarePromptBuilder:
         if relevant_skills:
             enhancement += self._build_skills_section(relevant_skills[:max_skills])
 
+        # Add debug skills section (common pitfalls)
+        if debug_skills:
+            enhancement += self._build_debug_skills_section(debug_skills[:max_debug_skills])
+
         # Combine with original prompt
         if enhancement:
+            guidance = "Use the above SOTA code and/or relevant patterns as reference when generating your solution."
+            if debug_skills:
+                guidance += "\nPay special attention to the common pitfalls section to avoid known issues."
+            guidance += "\nFocus on building upon what worked before while improving and innovating."
+
             enhanced = f"""{original_prompt}
 
 {enhancement}
 
-Use the above SOTA code and/or relevant patterns as reference when generating your solution.
-Focus on building upon what worked before while improving and innovating.
+{guidance}
 """
-            logger.debug(f"Enhanced prompt with {len(relevant_skills or [])} skills and {'SOTA code' if sota_code else 'no SOTA'}")
+            logger.debug(f"Enhanced prompt with {len(relevant_skills or [])} skills, {len(debug_skills or [])} debug skills, and {'SOTA code' if sota_code else 'no SOTA'}")
             return enhanced
         else:
             return original_prompt
@@ -112,10 +125,48 @@ Based on successful experiments from past competitions, here are proven patterns
 """
         return section
 
+    def _build_debug_skills_section(self, debug_skills: List[DebugSkill]) -> str:
+        """Build the debug skills (common pitfalls) section."""
+        section = """
+## ⚠️ Common Pitfalls to Avoid
+
+Based on past failures and their solutions, be aware of these common issues:
+
+"""
+        for i, skill in enumerate(debug_skills, 1):
+            severity_emoji = {"low": "ℹ️", "medium": "⚠️", "high": "🚨"}.get(skill.severity, "⚠️")
+
+            section += f"""### {severity_emoji} Pitfall {i}: {skill.name.replace('_', ' ').title()}
+
+**Symptom**: {skill.symptom[:300]}
+
+**Root Cause**: {skill.root_cause[:300]}
+
+**How to Avoid**:
+- {skill.description[:400]}
+
+**Failed Approach** (Don't do this):
+```python
+{skill.failed_approach[:600]}
+```
+
+**Correct Approach**:
+```python
+{skill.solution[:600]}
+```
+
+**Fix Success Rate**: {skill.fix_success_rate():.1%} across {skill.detection_count} encounters
+
+---
+
+"""
+        return section
+
     def build_task_prompt_with_context(
         self,
         task_description: str,
         relevant_skills: List[Skill] = None,
+        debug_skills: List[DebugSkill] = None,
         previous_attempt_code: Optional[str] = None,
         previous_error: Optional[str] = None
     ) -> str:
@@ -152,5 +203,10 @@ Please fix the error and improve the implementation.
         if relevant_skills:
             prompt += self._build_skills_section(relevant_skills)
             prompt += "\nConsider applying these patterns to avoid common pitfalls and improve your solution.\n"
+
+        # Add debug skills (especially relevant when there was an error)
+        if debug_skills:
+            prompt += self._build_debug_skills_section(debug_skills)
+            prompt += "\nCarefully review these common pitfalls to avoid repeating known mistakes.\n"
 
         return prompt
