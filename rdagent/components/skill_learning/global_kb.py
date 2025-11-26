@@ -5,6 +5,7 @@ from pathlib import Path
 import logging
 
 from rdagent.components.skill_learning.skill import Skill
+from rdagent.components.skill_learning.debug_skill import DebugSkill
 from rdagent.components.skill_learning.storage import GlobalKnowledgeStorage
 from rdagent.components.skill_learning.matcher import SkillMatcher
 
@@ -28,8 +29,10 @@ class GlobalKnowledgeBase:
         self.storage = GlobalKnowledgeStorage(storage_path)
         self.matcher = SkillMatcher(embedding_model)
         self.skill_cache = {}  # skill_id -> Skill
+        self.debug_skill_cache = {}  # debug_skill_id -> DebugSkill
         self.sota_cache = {}  # competition -> List[SOTAModel]
         self._skills_loaded = False
+        self._debug_skills_loaded = False
 
     def load_all_skills(self) -> List[Skill]:
         """Load all skills from disk (with caching)."""
@@ -210,9 +213,136 @@ class GlobalKnowledgeBase:
             skill.update_stats(success)
             self.storage.save_skill(skill)
 
+    def load_all_debug_skills(self) -> List[DebugSkill]:
+        """Load all debug skills from disk (with caching)."""
+        if self._debug_skills_loaded and self.debug_skill_cache:
+            return list(self.debug_skill_cache.values())
+
+        skill_ids = self.storage.list_debug_skills()
+        logger.info(f"Loading {len(skill_ids)} debug skills from global library")
+
+        for skill_id in skill_ids:
+            if skill_id not in self.debug_skill_cache:
+                debug_skill = self.storage.load_debug_skill(skill_id)
+                if debug_skill:
+                    self.debug_skill_cache[debug_skill.id] = debug_skill
+
+        self._debug_skills_loaded = True
+        logger.info(f"✅ Loaded {len(self.debug_skill_cache)} debug skills successfully")
+        return list(self.debug_skill_cache.values())
+
+    def query_debug_skills(
+        self,
+        context,
+        error_symptoms: str = "",
+        top_k: int = 3,
+        task_contexts: List[str] = None
+    ) -> List[DebugSkill]:
+        """
+        Find relevant debug skills based on context and error symptoms.
+
+        Args:
+            context: Current task/context (or string description)
+            error_symptoms: Optional error message or symptom description
+            top_k: Number of debug skills to return
+            task_contexts: Optional list of context tags
+
+        Returns:
+            List of relevant DebugSkill objects
+        """
+        # Load debug skills if not already loaded
+        all_debug_skills = self.load_all_debug_skills()
+
+        if not all_debug_skills:
+            return []
+
+        # Build search query from context and symptoms
+        if isinstance(context, str):
+            query = context
+        elif hasattr(context, 'description'):
+            query = context.description
+        elif hasattr(context, 'name'):
+            query = context.name
+        else:
+            query = str(context)
+
+        # Append error symptoms if provided
+        if error_symptoms:
+            query = f"{query} {error_symptoms}"
+
+        # Find relevant debug skills (reuse matcher logic)
+        relevant = self.matcher.find_relevant_skills(
+            task_description=query,
+            skill_library=all_debug_skills,
+            top_k=top_k,
+            task_contexts=task_contexts
+        )
+
+        debug_skills = [skill for skill, score in relevant]
+
+        if debug_skills:
+            logger.info(f"🔧 Found {len(debug_skills)} relevant debug skills")
+            for skill in debug_skills:
+                logger.debug(f"  - {skill.name} (fix rate: {skill.fix_success_rate():.1%}, severity: {skill.severity})")
+
+        return debug_skills
+
+    def add_or_update_debug_skill(self, debug_skill: DebugSkill):
+        """
+        Add new debug skill or update existing similar debug skill.
+
+        If a similar debug skill exists (same name or symptom),
+        merge them by adding the new example and updating stats.
+        """
+        # Check if debug skill with same name exists
+        existing_skill = self.debug_skill_cache.get(debug_skill.id)
+
+        if not existing_skill:
+            # Check for skills with same name (different IDs)
+            for cached_skill in self.debug_skill_cache.values():
+                if cached_skill.name == debug_skill.name:
+                    existing_skill = cached_skill
+                    logger.info(f"Found existing debug skill with same name: {debug_skill.name}")
+                    break
+
+        if existing_skill:
+            # Merge with existing debug skill
+            logger.info(f"Updating existing debug skill: {existing_skill.name}")
+
+            # Add new examples
+            existing_skill.examples.extend(debug_skill.examples)
+
+            # Update stats
+            existing_skill.detection_count += debug_skill.detection_count
+            existing_skill.fix_success_count += debug_skill.fix_success_count
+
+            # Merge contexts (deduplicate)
+            for context in debug_skill.applicable_contexts:
+                if context not in existing_skill.applicable_contexts:
+                    existing_skill.applicable_contexts.append(context)
+
+            # Merge source competitions
+            for comp in debug_skill.source_competitions:
+                if comp not in existing_skill.source_competitions:
+                    existing_skill.source_competitions.append(comp)
+
+            # Increment version
+            existing_skill.version += 1
+
+            # Save updated debug skill
+            self.storage.save_debug_skill(existing_skill)
+            self.debug_skill_cache[existing_skill.id] = existing_skill
+
+        else:
+            # Add new debug skill
+            logger.info(f"Adding new debug skill: {debug_skill.name}")
+            self.storage.save_debug_skill(debug_skill)
+            self.debug_skill_cache[debug_skill.id] = debug_skill
+
     def get_statistics(self) -> dict:
         """Get statistics about the global knowledge base."""
         all_skills = self.load_all_skills()
+        all_debug_skills = self.load_all_debug_skills()
 
         # Count competitions
         with open(self.storage.index_path, 'r') as f:
@@ -222,10 +352,16 @@ class GlobalKnowledgeBase:
 
         return {
             "total_skills": len(all_skills),
+            "total_debug_skills": len(all_debug_skills),
             "total_competitions": competition_count,
             "average_skill_success_rate": (
                 sum(s.success_rate() for s in all_skills) / len(all_skills)
                 if all_skills else 0.0
             ),
+            "average_debug_skill_fix_rate": (
+                sum(s.fix_success_rate() for s in all_debug_skills) / len(all_debug_skills)
+                if all_debug_skills else 0.0
+            ),
             "total_examples": sum(len(s.examples) for s in all_skills),
+            "total_debug_examples": sum(len(s.examples) for s in all_debug_skills),
         }

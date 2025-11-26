@@ -124,18 +124,27 @@ class DataScienceRDLoop(RDLoop):
         # Initialize global knowledge base (skill learning - always enabled)
         from rdagent.components.skill_learning.global_kb import GlobalKnowledgeBase
         from rdagent.components.skill_learning.extractor import SkillExtractor
+        from rdagent.components.skill_learning.debug_extractor import DebugSkillExtractor
 
         self.competition_name = PROP_SETTING.competition
         self.global_kb = GlobalKnowledgeBase()
         self.skill_extractor = SkillExtractor()
+        self.debug_skill_extractor = DebugSkillExtractor()
+
+        # Track recent experiments for failure pattern detection
+        self.experiment_history = []  # List of (experiment, feedback) tuples
 
         # Load all skills on startup
         self.global_kb.load_all_skills()
+        self.global_kb.load_all_debug_skills()
         stats = self.global_kb.get_statistics()
         logger.info(f"📚 Global Knowledge Base initialized:")
         logger.info(f"  - {stats['total_skills']} skills loaded")
+        logger.info(f"  - {stats['total_debug_skills']} debug skills loaded")
         logger.info(f"  - {stats['total_competitions']} competitions in history")
         logger.info(f"  - {stats['average_skill_success_rate']:.1%} average skill success rate")
+        if stats['total_debug_skills'] > 0:
+            logger.info(f"  - {stats['average_debug_skill_fix_rate']:.1%} average debug skill fix rate")
 
         # Pass global KB to all coders
         for coder in [self.data_loader_coder, self.feature_coder, self.model_coder,
@@ -170,6 +179,92 @@ class DataScienceRDLoop(RDLoop):
 
         super(RDLoop, self).__init__()
 
+    def _has_valid_score(self, exp, feedback) -> bool:
+        """
+        Check if experiment completed successfully with a valid score.
+
+        Returns True if the experiment produced a valid numeric score,
+        regardless of whether it beat SOTA.
+        """
+        # Try to get score from feedback first
+        score_raw = getattr(feedback, 'score', None)
+
+        # Fallback: extract from exp.result
+        if score_raw is None and hasattr(exp, 'result') and exp.result is not None:
+            try:
+                import pandas as pd
+                df = pd.DataFrame(exp.result)
+                if 'ensemble' in df.index:
+                    score_raw = df.loc["ensemble"].iloc[0]
+            except Exception:
+                pass
+
+        # Convert to float and validate
+        if score_raw is not None:
+            try:
+                import numpy as np
+                score = float(score_raw)
+                return not (np.isnan(score) or np.isinf(score))
+            except (ValueError, TypeError):
+                pass
+
+        return False
+
+    def _detect_failure_patterns(self, current_exp, current_feedback) -> Optional[tuple[str, any, any]]:
+        """
+        Detect failure-to-success patterns for debug skill extraction.
+
+        Returns:
+            Tuple of (pattern_type, failed_exp/feedback, success_exp/feedback) if pattern found, None otherwise
+            pattern_type: "consecutive", "error_fix", or "hypothesis_evolution"
+        """
+        # Pattern 1: Consecutive experiments (failed → succeeded)
+        # Check if previous experiment failed and current one succeeded
+        if len(self.experiment_history) >= 1:
+            prev_exp, prev_feedback = self.experiment_history[-1]
+
+            # Check if current succeeded and previous failed
+            current_success = self._has_valid_score(current_exp, current_feedback)
+            prev_failed = not self._has_valid_score(prev_exp, prev_feedback)
+
+            if current_success and prev_failed:
+                logger.info("🔍 Detected consecutive failure→success pattern")
+                return ("consecutive", (prev_exp, prev_feedback), (current_exp, current_feedback))
+
+        # Pattern 2: Error-based (feedback contains errors but experiment improved)
+        # Check if current feedback mentions errors but decision is positive
+        if hasattr(current_feedback, 'observations'):
+            obs = str(current_feedback.observations).lower()
+            has_error_mention = any(keyword in obs for keyword in ['error', 'exception', 'fix', 'solved', 'resolved'])
+            current_success = self._has_valid_score(current_exp, current_feedback)
+
+            if has_error_mention and current_success:
+                logger.info("🔍 Detected error-fix pattern in feedback")
+                return ("error_fix", current_feedback, (current_exp, current_feedback))
+
+        # Pattern 3: Hypothesis evolution (similar hypothesis rejected before, now accepted)
+        # Check if current hypothesis was previously rejected but now accepted
+        if hasattr(current_exp, 'hypothesis') and self._has_valid_score(current_exp, current_feedback):
+            current_hyp = str(current_exp.hypothesis).lower() if hasattr(current_exp.hypothesis, '__str__') else ""
+
+            # Look for similar rejected hypotheses in history
+            for prev_exp, prev_feedback in self.experiment_history[-5:]:  # Check last 5
+                if hasattr(prev_exp, 'hypothesis') and not self._has_valid_score(prev_exp, prev_feedback):
+                    prev_hyp = str(prev_exp.hypothesis).lower() if hasattr(prev_exp.hypothesis, '__str__') else ""
+
+                    # Simple similarity check (can be improved with embeddings)
+                    if prev_hyp and current_hyp and len(prev_hyp) > 20 and len(current_hyp) > 20:
+                        # Check for common words (simple approach)
+                        prev_words = set(prev_hyp.split())
+                        curr_words = set(current_hyp.split())
+                        overlap = len(prev_words & curr_words) / max(len(prev_words), len(curr_words))
+
+                        if overlap > DS_RD_SETTING.debug_skill_hypothesis_overlap_threshold:
+                            logger.info("🔍 Detected hypothesis evolution pattern")
+                            return ("hypothesis_evolution", (prev_exp, prev_feedback), (current_exp, current_feedback))
+
+        return None
+
     def _should_extract_skill_from_score(self, score: Optional[float]) -> tuple[bool, str]:
         """
         Determine if skill should be extracted based on relative score quality.
@@ -193,13 +288,28 @@ class DataScienceRDLoop(RDLoop):
         # Get recent successful experiment scores from trace history
         recent_scores = []
         for exp, fb in self.trace.hist:
-            if hasattr(fb, 'decision') and fb.decision and hasattr(fb, 'score'):
-                try:
-                    exp_score = float(fb.score)
-                    if not np.isnan(exp_score) and not np.isinf(exp_score):
-                        recent_scores.append(exp_score)
-                except (ValueError, TypeError):
-                    continue
+            if hasattr(fb, 'decision'):
+                # Try to get score from feedback first
+                exp_score_raw = getattr(fb, 'score', None)
+
+                # Fallback: extract from exp.result if not in feedback
+                if exp_score_raw is None and hasattr(exp, 'result') and exp.result is not None:
+                    try:
+                        import pandas as pd
+                        df = pd.DataFrame(exp.result)
+                        if 'ensemble' in df.index:
+                            exp_score_raw = df.loc["ensemble"].iloc[0]
+                    except Exception:
+                        continue
+
+                # Convert to float and validate
+                if exp_score_raw is not None:
+                    try:
+                        exp_score = float(exp_score_raw)
+                        if not np.isnan(exp_score) and not np.isinf(exp_score):
+                            recent_scores.append(exp_score)
+                    except (ValueError, TypeError):
+                        continue
 
         # Bootstrap phase: not enough samples yet - always extract
         min_samples = DS_RD_SETTING.skill_extraction_min_samples
@@ -312,9 +422,22 @@ class DataScienceRDLoop(RDLoop):
 
             # Skill learning: Extract skills from successful experiments
             feedback = prev_out["feedback"]
-            if hasattr(self, 'global_kb') and hasattr(feedback, 'decision') and feedback.decision:
-                # Convert score from string to float (feedback.score is a string in DSRunnerFeedback)
+            if hasattr(self, 'global_kb') and hasattr(feedback, 'decision'):
+                # Try to get score from feedback first (DSRunnerFeedback has score attribute)
                 score_raw = getattr(feedback, 'score', None)
+
+                # Fallback: extract from exp.result if not in feedback (for HypothesisFeedback)
+                if score_raw is None and hasattr(exp, 'result') and exp.result is not None:
+                    try:
+                        import pandas as pd
+                        df = pd.DataFrame(exp.result)
+                        if 'ensemble' in df.index:
+                            score_raw = df.loc["ensemble"].iloc[0]
+                            logger.info(f"Extracted score from exp.result: {score_raw}")
+                    except Exception as e:
+                        logger.info(f"Could not extract score from exp.result: {e}")
+
+                # Convert score to float
                 score = None
                 if score_raw is not None:
                     try:
@@ -340,7 +463,7 @@ class DataScienceRDLoop(RDLoop):
                     except Exception as e:
                         logger.error(f"Error extracting skills: {e}")
                 else:
-                    logger.debug(f"⏭️  Skipping skill extraction: {reason}")
+                    logger.info(f"⏭️  Skipping skill extraction: {reason}")
 
                 # Update SOTA if this is better than current best
                 # For metrics like Log Loss where lower is better, we compare appropriately
@@ -362,6 +485,60 @@ class DataScienceRDLoop(RDLoop):
                             logger.info(f"🏆 New SOTA for {self.competition_name}: rank {rank}, score {score:.6f}")
                     except Exception as e:
                         logger.error(f"Error saving SOTA: {e}")
+
+            # Debug skill learning: Extract problem-solving patterns from failures
+            if DS_RD_SETTING.enable_debug_skill_extraction and hasattr(self, 'debug_skill_extractor') and hasattr(self, 'global_kb'):
+                try:
+                    # Detect failure patterns
+                    pattern = self._detect_failure_patterns(exp, feedback)
+
+                    if pattern:
+                        pattern_type, failed_data, success_data = pattern
+                        logger.info(f"🐛 Detected {pattern_type} pattern, extracting debug skill...")
+
+                        debug_skill = None
+                        if pattern_type == "consecutive":
+                            # Extract from failure-success transition
+                            failed_exp, failed_feedback = failed_data
+                            success_exp, success_feedback = success_data
+                            debug_skill = self.debug_skill_extractor.extract_from_transition(
+                                failed_experiment=failed_exp,
+                                success_experiment=success_exp,
+                                failed_feedback=failed_feedback,
+                                success_feedback=success_feedback,
+                                competition_context=self.competition_name
+                            )
+                        elif pattern_type == "error_fix":
+                            # Extract from error fix
+                            debug_skill = self.debug_skill_extractor.extract_from_error_fix(
+                                experiment=exp,
+                                feedback=feedback,
+                                competition_context=self.competition_name
+                            )
+                        elif pattern_type == "hypothesis_evolution":
+                            # Extract from hypothesis evolution
+                            failed_exp, failed_feedback = failed_data
+                            success_exp, success_feedback = success_data
+                            debug_skill = self.debug_skill_extractor.extract_from_transition(
+                                failed_experiment=failed_exp,
+                                success_experiment=success_exp,
+                                failed_feedback=failed_feedback,
+                                success_feedback=success_feedback,
+                                competition_context=self.competition_name
+                            )
+
+                        if debug_skill:
+                            self.global_kb.add_or_update_debug_skill(debug_skill)
+                            logger.info(f"🔧 Learned debug skill: {debug_skill.name} (severity: {debug_skill.severity})")
+                except Exception as e:
+                    logger.error(f"Error extracting debug skill: {e}")
+
+            # Add to experiment history (keep last N experiments based on config)
+            if hasattr(self, 'experiment_history'):
+                self.experiment_history.append((exp, feedback))
+                max_history = DS_RD_SETTING.debug_skill_history_window
+                if len(self.experiment_history) > max_history:
+                    self.experiment_history.pop(0)
 
         else:
             exp: DSExperiment = prev_out["direct_exp_gen"] if isinstance(e, CoderError) else prev_out["coding"]
@@ -389,6 +566,14 @@ class DataScienceRDLoop(RDLoop):
                 cur_loop_id,
             )
             # Value backpropagation is handled in async_gen before next() via observe_commits
+
+            # Add failed experiment to history for debugging skill extraction
+            if hasattr(self, 'experiment_history'):
+                error_feedback = ExperimentFeedback.from_exception(e)
+                self.experiment_history.append((exp, error_feedback))
+                max_history = DS_RD_SETTING.debug_skill_history_window
+                if len(self.experiment_history) > max_history:
+                    self.experiment_history.pop(0)
 
             if self.trace.sota_experiment() is None:
                 if DS_RD_SETTING.coder_on_whole_pipeline:

@@ -75,7 +75,7 @@ class DataScienceBasePropSetting(KaggleBasePropSetting):
     show_nan_columns: bool = False
 
     ### knowledge base
-    enable_knowledge_base: bool = False
+    enable_knowledge_base: bool = True
     knowledge_base_version: str = "v1"
     knowledge_base_path: str | None = None
     idea_pool_json_path: str | None = None
@@ -95,6 +95,22 @@ class DataScienceBasePropSetting(KaggleBasePropSetting):
 
     sota_models_to_keep: int = 3
     """Number of top SOTA models to keep per competition"""
+
+    ### debug skill learning (failure-to-success pattern extraction)
+    enable_debug_skill_extraction: bool = True
+    """Enable extraction of problem-solving patterns from failures"""
+
+    max_debug_skills_per_prompt: int = 2
+    """Maximum number of debug skills (pitfalls) to include in code generation prompts"""
+
+    min_debug_skill_fix_rate: float = 0.5
+    """Minimum fix success rate for a debug skill to be considered for use"""
+
+    debug_skill_history_window: int = 10
+    """Number of recent experiments to keep in history for failure pattern detection"""
+
+    debug_skill_hypothesis_overlap_threshold: float = 0.5
+    """Minimum hypothesis similarity (word overlap) to detect hypothesis evolution pattern"""
 
     ### archive log folder after each loop
     enable_log_archive: bool = True

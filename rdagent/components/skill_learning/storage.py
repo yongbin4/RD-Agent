@@ -6,6 +6,7 @@ import json
 import logging
 
 from rdagent.components.skill_learning.skill import Skill
+from rdagent.components.skill_learning.debug_skill import DebugSkill
 
 if TYPE_CHECKING:
     from rdagent.components.experiment_learning.sota import SOTAModel
@@ -20,12 +21,14 @@ class GlobalKnowledgeStorage:
         """Initialize storage paths."""
         self.base_path = base_path or (Path.home() / ".rdagent" / "global_knowledge")
         self.skills_dir = self.base_path / "skills"
+        self.debugging_skills_dir = self.base_path / "debugging_skills"
         self.competitions_dir = self.base_path / "competitions"
         self.index_path = self.base_path / "index.json"
         self.changelog_path = self.base_path / "CHANGELOG.md"
 
         # Create directories
         self.skills_dir.mkdir(parents=True, exist_ok=True)
+        self.debugging_skills_dir.mkdir(parents=True, exist_ok=True)
         self.competitions_dir.mkdir(parents=True, exist_ok=True)
 
         # Initialize index if doesn't exist
@@ -40,6 +43,7 @@ class GlobalKnowledgeStorage:
             "version": "1.0",
             "created_at": "",
             "skills": {},  # skill_id -> skill metadata
+            "debugging_skills": {},  # debug_skill_id -> debug skill metadata
             "competitions": {},  # competition_name -> metadata
         }
         self.index_path.write_text(json.dumps(index, indent=2))
@@ -101,6 +105,72 @@ class GlobalKnowledgeStorage:
         for skill_dir in self.skills_dir.glob("skill_*"):
             if skill_dir.is_dir():
                 # Extract ID from directory name: skill_{id}_{name}
+                parts = skill_dir.name.split("_", 2)
+                if len(parts) >= 2:
+                    skill_ids.append(parts[1])
+        return skill_ids
+
+    def save_debug_skill(self, debug_skill: DebugSkill):
+        """Save debug skill to markdown + metadata files."""
+        # Create debug skill directory
+        skill_dir = self.debugging_skills_dir / f"debug_{debug_skill.id}_{debug_skill.name}"
+        skill_dir.mkdir(parents=True, exist_ok=True)
+
+        # Save README.md
+        (skill_dir / "README.md").write_text(debug_skill.to_markdown())
+
+        # Save example files (both failed and solution code)
+        for i, example in enumerate(debug_skill.examples):
+            # Save failed approach
+            failed_file = skill_dir / f"example_{example.competition}_failed.py"
+            failed_file.write_text(
+                f"# Failed approach from {example.competition}\n"
+                f"# Symptom: {example.symptom}\n"
+                f"# Score before fix: {example.before_score if example.before_score else 'N/A'}\n\n"
+                f"{example.failed_code}\n"
+            )
+
+            # Save solution
+            solution_file = skill_dir / f"example_{example.competition}_solution.py"
+            solution_file.write_text(
+                f"# Solution from {example.competition}\n"
+                f"# Score after fix: {example.after_score:.4f}\n"
+                f"# Context: {example.context}\n\n"
+                f"{example.solution_code}\n"
+            )
+
+        # Save metadata.json
+        (skill_dir / "metadata.json").write_text(json.dumps(debug_skill.to_dict(), indent=2))
+
+        # Update index
+        self._update_index_debug_skill(debug_skill)
+
+        # Log to changelog
+        self._log_changelog(f"Added/Updated debug skill: {debug_skill.name} (ID: {debug_skill.id})")
+
+        logger.info(f"Saved debug skill: {debug_skill.name} (ID: {debug_skill.id})")
+
+    def load_debug_skill(self, skill_id: str) -> Optional[DebugSkill]:
+        """Load debug skill from directory by ID."""
+        # Find debug skill directory
+        skill_dirs = list(self.debugging_skills_dir.glob(f"debug_{skill_id}_*"))
+        if not skill_dirs:
+            logger.warning(f"Debug skill not found: {skill_id}")
+            return None
+
+        skill_dir = skill_dirs[0]
+        try:
+            return DebugSkill.from_directory(skill_dir)
+        except Exception as e:
+            logger.error(f"Error loading debug skill from {skill_dir}: {e}")
+            return None
+
+    def list_debug_skills(self) -> List[str]:
+        """List all debug skill IDs."""
+        skill_ids = []
+        for skill_dir in self.debugging_skills_dir.glob("debug_*"):
+            if skill_dir.is_dir():
+                # Extract ID from directory name: debug_{id}_{name}
                 parts = skill_dir.name.split("_", 2)
                 if len(parts) >= 2:
                     skill_ids.append(parts[1])
@@ -171,6 +241,26 @@ class GlobalKnowledgeStorage:
             "success_rate": skill.success_rate(),
             "contexts": skill.applicable_contexts,
             "examples_count": len(skill.examples),
+        }
+
+        with open(self.index_path, "w") as f:
+            json.dump(index, f, indent=2)
+
+    def _update_index_debug_skill(self, debug_skill: DebugSkill):
+        """Update index with debug skill metadata."""
+        with open(self.index_path, "r") as f:
+            index = json.load(f)
+
+        # Ensure debugging_skills key exists
+        if "debugging_skills" not in index:
+            index["debugging_skills"] = {}
+
+        index["debugging_skills"][debug_skill.id] = {
+            "name": debug_skill.name,
+            "fix_success_rate": debug_skill.fix_success_rate(),
+            "contexts": debug_skill.applicable_contexts,
+            "examples_count": len(debug_skill.examples),
+            "severity": debug_skill.severity,
         }
 
         with open(self.index_path, "w") as f:
@@ -247,6 +337,7 @@ class GlobalKnowledgeStorage:
         index = {
             "version": "1.0",
             "skills": {},
+            "debugging_skills": {},
             "competitions": {},
         }
 
@@ -259,6 +350,18 @@ class GlobalKnowledgeStorage:
                     "success_rate": skill.success_rate(),
                     "contexts": skill.applicable_contexts,
                     "examples_count": len(skill.examples),
+                }
+
+        # Index all debug skills
+        for skill_id in self.list_debug_skills():
+            debug_skill = self.load_debug_skill(skill_id)
+            if debug_skill:
+                index["debugging_skills"][debug_skill.id] = {
+                    "name": debug_skill.name,
+                    "fix_success_rate": debug_skill.fix_success_rate(),
+                    "contexts": debug_skill.applicable_contexts,
+                    "examples_count": len(debug_skill.examples),
+                    "severity": debug_skill.severity,
                 }
 
         # Index all competitions
