@@ -57,6 +57,16 @@ class FeatureMultiProcessEvolvingStrategy(MultiProcessEvolvingStrategy):
             queried_former_failed_knowledge[1],
         )
 
+        # Get relevant skills from global KB
+        relevant_skills = []
+        if queried_knowledge is not None:
+            relevant_skills = getattr(queried_knowledge, 'relevant_skills', {}).get(feature_information_str, [])
+
+        # Get relevant debug skills (failure patterns to avoid)
+        relevant_debug_skills = []
+        if queried_knowledge is not None:
+            relevant_debug_skills = getattr(queried_knowledge, 'relevant_debug_skills', {}).get(feature_information_str, [])
+
         # 2. code
         system_prompt = T(".prompts:feature_coder.system").r(
             competition_info=self.scen.get_scenario_all_desc(eda_output=workspace.file_dict.get("EDA.md", None)),
@@ -64,6 +74,8 @@ class FeatureMultiProcessEvolvingStrategy(MultiProcessEvolvingStrategy):
             data_loader_code=workspace.file_dict.get("load_data.py"),
             queried_similar_successful_knowledge=queried_similar_successful_knowledge,
             queried_former_failed_knowledge=queried_former_failed_knowledge[0],
+            relevant_skills=relevant_skills,
+            relevant_debug_skills=relevant_debug_skills,
             out_spec=PythonAgentOut.get_spec(),
         )
         code_spec = (

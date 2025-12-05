@@ -84,6 +84,24 @@ class GlobalKnowledgeStorage:
 
         logger.info(f"Saved skill: {skill.name} (ID: {skill.id})")
 
+    def delete_skill(self, skill_id: str) -> bool:
+        """Delete a skill from storage."""
+        try:
+            # Find skill directory
+            skill_dirs = list(self.skills_dir.glob(f"skill_{skill_id}_*"))
+            if not skill_dirs:
+                logger.warning(f"Skill not found for deletion: {skill_id}")
+                return False
+
+            # Delete directory
+            import shutil
+            shutil.rmtree(skill_dirs[0])
+            logger.info(f"Deleted skill: {skill_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete skill {skill_id}: {e}")
+            return False
+
     def load_skill(self, skill_id: str) -> Optional[Skill]:
         """Load skill from directory by ID."""
         # Find skill directory
@@ -132,9 +150,10 @@ class GlobalKnowledgeStorage:
 
             # Save solution
             solution_file = skill_dir / f"example_{example.competition}_solution.py"
+            after_score_str = f"{example.after_score:.4f}" if example.after_score is not None else "N/A"
             solution_file.write_text(
                 f"# Solution from {example.competition}\n"
-                f"# Score after fix: {example.after_score:.4f}\n"
+                f"# Score after fix: {after_score_str}\n"
                 f"# Context: {example.context}\n\n"
                 f"{example.solution_code}\n"
             )
@@ -149,6 +168,24 @@ class GlobalKnowledgeStorage:
         self._log_changelog(f"Added/Updated debug skill: {debug_skill.name} (ID: {debug_skill.id})")
 
         logger.info(f"Saved debug skill: {debug_skill.name} (ID: {debug_skill.id})")
+
+    def delete_debug_skill(self, skill_id: str) -> bool:
+        """Delete a debug skill from storage."""
+        try:
+            # Find debug skill directory
+            skill_dirs = list(self.debugging_skills_dir.glob(f"debug_{skill_id}_*"))
+            if not skill_dirs:
+                logger.warning(f"Debug skill not found for deletion: {skill_id}")
+                return False
+
+            # Delete directory
+            import shutil
+            shutil.rmtree(skill_dirs[0])
+            logger.info(f"Deleted debug skill: {skill_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete debug skill {skill_id}: {e}")
+            return False
 
     def load_debug_skill(self, skill_id: str) -> Optional[DebugSkill]:
         """Load debug skill from directory by ID."""

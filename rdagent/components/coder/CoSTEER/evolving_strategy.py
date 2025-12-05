@@ -87,7 +87,7 @@ class MultiProcessEvolvingStrategy(EvolvingStrategy):
             assert isinstance(last_feedback, CoSTEERMultiFeedback)
 
         # Query relevant skills from global knowledge base (if available)
-        if hasattr(self, 'global_kb') and hasattr(self, 'competition_name'):
+        if hasattr(self, 'global_kb') and hasattr(self, 'competition_name') and queried_knowledge is not None:
             try:
                 # Query skills for each task
                 for task in evo.sub_tasks:
@@ -96,6 +96,18 @@ class MultiProcessEvolvingStrategy(EvolvingStrategy):
                         queried_knowledge.relevant_skills = {}
                     task_info = task.get_task_information()
                     queried_knowledge.relevant_skills[task_info] = relevant_skills
+
+                    # Also query debug skills for common failure patterns
+                    # Note: Don't pass task_info as task_contexts - it's a full description,
+                    # not context tags. Let it match on text similarity instead.
+                    debug_skills = self.global_kb.query_debug_skills(
+                        context=task,
+                        task_contexts=None,
+                        top_k=2
+                    )
+                    if not hasattr(queried_knowledge, 'relevant_debug_skills'):
+                        queried_knowledge.relevant_debug_skills = {}
+                    queried_knowledge.relevant_debug_skills[task_info] = debug_skills
 
                 # Also get SOTA code
                 sota_models = self.global_kb.get_sota(self.competition_name, top_k=1)

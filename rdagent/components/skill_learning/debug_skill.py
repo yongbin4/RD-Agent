@@ -18,7 +18,7 @@ class DebugExample:
     solution_code: str  # The fixed code
     context: str  # Task context when this occurred
     before_score: Optional[float]  # Score before fix (if applicable)
-    after_score: float  # Score after fix
+    after_score: Optional[float] = None  # Score after fix (None if unknown)
     timestamp: datetime = field(default_factory=datetime.now)
 
     def to_dict(self) -> dict:
@@ -123,13 +123,14 @@ class DebugSkill:
 """
         for i, example in enumerate(self.examples, 1):
             score_change = ""
-            if example.before_score is not None:
+            if example.before_score is not None and example.after_score is not None:
                 score_change = f" (improved from {example.before_score:.4f} to {example.after_score:.4f})"
 
+            after_score_str = f"{example.after_score:.4f}" if example.after_score is not None else "N/A"
             md += f"""### Example {i}: {example.competition}
 - **Context**: {example.context}
 - **Symptom**: {example.symptom}
-- **Result**: Score {example.after_score:.4f}{score_change}
+- **Result**: Score {after_score_str}{score_change}
 - **Date**: {example.timestamp.strftime('%Y-%m-%d')}
 
 **Failed Code**:

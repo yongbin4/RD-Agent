@@ -3,6 +3,8 @@ import runpy
 from pathlib import Path
 from typing import Dict
 
+import pandas as pd
+
 from rdagent.app.data_science.conf import DS_RD_SETTING
 from rdagent.components.coder.data_science.conf import get_ds_env
 from rdagent.core.experiment import FBWorkspace
@@ -215,6 +217,7 @@ class DataScienceScen(Scenario):
             debug_time_limit=None,
             recommend_debug_time_limit=None,
             runtime_environment=self.get_runtime_environment(),
+            sample_submission_format=self.get_sample_submission_format(),
         )
 
     def get_scenario_all_desc(self, eda_output=None) -> str:
@@ -241,6 +244,7 @@ class DataScienceScen(Scenario):
                 f"{self.recommend_debug_timeout() / 60 : .2f} minutes" if DS_RD_SETTING.sample_data_by_LLM else None
             ),
             runtime_environment=self.get_runtime_environment(),
+            sample_submission_format=self.get_sample_submission_format(),
         )
 
     def get_runtime_environment(self) -> str:
@@ -254,6 +258,21 @@ class DataScienceScen(Scenario):
         return describe_data_folder_v2(
             Path(DS_RD_SETTING.local_data_path) / self.competition, show_nan_columns=DS_RD_SETTING.show_nan_columns
         )
+
+    def get_sample_submission_format(self) -> str | None:
+        """Extract sample submission format from data folder if available."""
+        sample_sub_path = Path(DS_RD_SETTING.local_data_path) / self.competition / "sample_submission.csv"
+        if sample_sub_path.exists():
+            try:
+                df = pd.read_csv(sample_sub_path, nrows=5)
+                format_str = "Sample submission format (for reference, DO NOT read this file in code):\n"
+                format_str += f"- Required columns (exact names, case-sensitive): {df.columns.tolist()}\n"
+                format_str += f"- Index column: {df.index.name if df.index.name else 'None (default integer index)'}\n"
+                format_str += f"- Example rows:\n{df.to_string(max_rows=3)}"
+                return format_str
+            except Exception as e:
+                logger.warning(f"Could not read sample_submission.csv: {e}")
+        return None
 
 
 class KaggleScen(DataScienceScen):

@@ -17,6 +17,10 @@ scenario_description: |-
   Please ensure your submission adheres to the following specifications:
   {{ submission_specifications }}
 
+  {% if sample_submission_format is not none %}
+  {{ sample_submission_format }}
+  {% endif %}
+
   ====== Important Guidelines ======
   Before submitting your results, please note the following:
   - We have numerous tests in place to check your code.

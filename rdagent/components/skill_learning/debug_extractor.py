@@ -86,7 +86,9 @@ class DebugSkillExtractor:
         success_experiment,
         failed_feedback,
         success_feedback,
-        competition_context: str = ""
+        competition_context: str = "",
+        before_score: Optional[float] = None,
+        after_score: Optional[float] = None
     ) -> Optional[DebugSkill]:
         """
         Extract debug skill from a failure-to-success transition.
@@ -97,6 +99,8 @@ class DebugSkillExtractor:
             failed_feedback: Feedback from the failed experiment
             success_feedback: Feedback from the successful experiment
             competition_context: Name/description of the competition
+            before_score: Explicit score from failed experiment (if not provided, tries feedback.score)
+            after_score: Explicit score from success experiment (if not provided, tries feedback.score)
 
         Returns:
             DebugSkill object if meaningful pattern found, None otherwise
@@ -135,7 +139,9 @@ class DebugSkillExtractor:
                 success_experiment,
                 failed_feedback,
                 success_feedback,
-                competition_context
+                competition_context,
+                before_score=before_score,
+                after_score=after_score
             )
 
             if debug_skill:
@@ -313,6 +319,65 @@ Return JSON object (or empty {{}} if not meaningful):
 
         return "\n".join(error_parts)
 
+    def _is_valid_debug_skill(self, skill_data: dict) -> bool:
+        """
+        Validate that extracted skill is meaningful and not trivial.
+
+        Rejects:
+        - Skills where solution is identical to failed approach
+        - Trivial errors (syntax errors, typos, missing imports)
+        - Too short solutions (< 20 characters)
+        - Skills with no clear fix pattern
+
+        Args:
+            skill_data: Dictionary containing extracted skill fields
+
+        Returns:
+            True if skill passes quality validation, False otherwise
+        """
+        solution = skill_data.get('solution', '')
+        failed_approach = skill_data.get('failed_approach', '')
+        symptom = skill_data.get('symptom', '').lower()
+        name = skill_data.get('name', '').lower()
+        description = skill_data.get('description', '').lower()
+
+        # Reject if solution is identical to failed approach
+        if solution and failed_approach and solution.strip() == failed_approach.strip():
+            logger.debug("Rejected: solution identical to failed approach")
+            return False
+
+        # Reject trivial errors that aren't worth learning
+        trivial_keywords = [
+            'syntax error', 'syntaxerror',
+            'typo', 'typographical',
+            'missing comma', 'missing colon', 'missing parenthesis',
+            'indentation error', 'indentationerror',
+            'missing import',  # Simple import fixes
+            'namenotfounderror',
+            'misspelled', 'misspelling',
+        ]
+        combined_text = f"{symptom} {name} {description}"
+        if any(kw in combined_text for kw in trivial_keywords):
+            logger.debug(f"Rejected trivial error: {name}")
+            return False
+
+        # Require minimum length for meaningful solution
+        if len(solution.strip()) < 20:
+            logger.debug(f"Rejected: solution too short ({len(solution)} chars)")
+            return False
+
+        # Require minimum description length
+        if len(skill_data.get('description', '').strip()) < 10:
+            logger.debug("Rejected: description too short")
+            return False
+
+        # Require symptom to be descriptive
+        if len(symptom.strip()) < 10:
+            logger.debug("Rejected: symptom too short")
+            return False
+
+        return True
+
     def _parse_llm_response(
         self,
         response: str,
@@ -320,7 +385,9 @@ Return JSON object (or empty {{}} if not meaningful):
         success_experiment,
         failed_feedback,
         success_feedback,
-        competition: str
+        competition: str,
+        before_score: Optional[float] = None,
+        after_score: Optional[float] = None
     ) -> Optional[DebugSkill]:
         """Parse LLM JSON response into DebugSkill object."""
         try:
@@ -337,20 +404,26 @@ Return JSON object (or empty {{}} if not meaningful):
                 logger.warning(f"Missing required fields in debug skill: {skill_data.keys()}")
                 return None
 
-            # Create debug example
-            before_score = None
-            if failed_feedback and hasattr(failed_feedback, "score"):
+            # Validate skill quality - reject trivial/invalid patterns
+            if not self._is_valid_debug_skill(skill_data):
+                logger.debug(f"Rejected trivial/invalid debug skill: {skill_data.get('name', 'unknown')}")
+                return None
+
+            # Use passed scores, fall back to feedback.score if not provided
+            if before_score is None and failed_feedback and hasattr(failed_feedback, "score"):
                 try:
                     before_score = float(failed_feedback.score)
                 except:
                     pass
 
-            after_score = 0.0
-            if hasattr(success_feedback, "score"):
+            if after_score is None and hasattr(success_feedback, "score"):
                 try:
                     after_score = float(success_feedback.score)
                 except:
                     pass
+            # Ensure after_score is never None
+            if after_score is None:
+                after_score = 0.0
 
             # Get code snippets
             failed_code = skill_data.get("failed_approach", "")

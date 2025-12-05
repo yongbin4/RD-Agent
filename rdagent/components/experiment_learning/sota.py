@@ -92,8 +92,15 @@ class SOTAModel:
         )
 
     @classmethod
-    def from_experiment(cls, experiment, feedback, rank: int = 1) -> "SOTAModel":
-        """Convert an experiment to SOTA model."""
+    def from_experiment(cls, experiment, feedback, rank: int = 1, score: Optional[float] = None) -> "SOTAModel":
+        """Convert an experiment to SOTA model.
+
+        Args:
+            experiment: The experiment object
+            feedback: The feedback object
+            rank: SOTA rank (1, 2, or 3)
+            score: Optional score (if not provided, will try to extract from feedback)
+        """
         from rdagent.core.experiment import Experiment
 
         # Extract code files from workspace
@@ -114,13 +121,12 @@ class SOTAModel:
         if hasattr(experiment, "hypothesis"):
             hypothesis = str(experiment.hypothesis)
 
-        # Extract score from feedback
-        score = 0.0
-        if hasattr(feedback, "score"):
-            score = float(feedback.score)
-        elif hasattr(feedback, "final_decision"):
-            # Try to extract score from observations
-            score = 0.0  # Default
+        # Use passed score or fallback to feedback
+        if score is None:
+            if hasattr(feedback, "score"):
+                score = float(feedback.score)
+            else:
+                score = 0.0
 
         return cls(
             competition="unknown",  # Will be set by caller
