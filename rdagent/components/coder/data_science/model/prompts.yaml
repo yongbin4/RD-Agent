@@ -32,6 +32,41 @@ model_coder:
     {% endfor %}
     {% endif %}
 
+    {% if relevant_skills is defined and relevant_skills|length != 0 %}
+    --------- Proven Patterns from Global Knowledge Base ---------
+    The following patterns have been extracted from successful experiments across various competitions.
+    Consider applying these techniques to improve your solution.
+    {% for skill in relevant_skills %}
+    =====Pattern {{ loop.index }}: {{ skill.name }}=====
+    **When to use**: {{ skill.applicable_contexts | join(', ') }}
+    **Success rate**: {{ "%.0f" | format(skill.success_rate() * 100) }}%
+    **Description**: {{ skill.description }}
+    **Code pattern**:
+    ```python
+    {{ skill.code_pattern }}
+    ```
+    {% endfor %}
+    {% endif %}
+
+    {% if relevant_debug_skills is defined and relevant_debug_skills|length != 0 %}
+    --------- Common Pitfalls to Avoid ---------
+    The following failure patterns have been observed in similar tasks. Avoid these mistakes:
+    {% for debug_skill in relevant_debug_skills %}
+    =====Pitfall {{ loop.index }}: {{ debug_skill.name }}=====
+    **Symptom**: {{ debug_skill.symptom }}
+    **Root Cause**: {{ debug_skill.root_cause }}
+    **Severity**: {{ debug_skill.severity }}
+    **What NOT to do**:
+    ```python
+    {{ debug_skill.failed_approach }}
+    ```
+    **Correct approach**:
+    ```python
+    {{ debug_skill.solution }}
+    ```
+    {% endfor %}
+    {% endif %}
+
     ## Guidelines
     1. The function's input is from the output of a feature engineering function whose input is the output of a data loading function. The data loader function and feature engineering function code is as follows:
     --------- Data Loader Code ---------

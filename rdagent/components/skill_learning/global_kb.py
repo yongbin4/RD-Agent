@@ -102,55 +102,101 @@ class GlobalKnowledgeBase:
 
         return skills
 
+    def _compare_skills(self, existing: Skill, new: Skill) -> str:
+        """Use LLM to decide whether to REPLACE, SKIP, or MERGE skills."""
+        from rdagent.oai.llm_utils import APIBackend
+
+        prompt = f"""Compare these two ML skills and decide how to manage them:
+
+EXISTING SKILL:
+Name: {existing.name}
+Success Rate: {existing.success_rate():.1%} ({existing.success_count}/{existing.attempt_count} attempts)
+Competitions: {', '.join(existing.source_competitions[:3])}
+Contexts: {', '.join(existing.applicable_contexts[:3])}
+Examples: {len(existing.examples)}
+Description: {existing.description[:200]}...
+
+NEW SKILL:
+Name: {new.name}
+Success Rate: {new.success_rate():.1%} ({new.success_count}/{new.attempt_count} attempts)
+Competitions: {', '.join(new.source_competitions[:3])}
+Contexts: {', '.join(new.applicable_contexts[:3])}
+Examples: {len(new.examples)}
+Description: {new.description[:200]}...
+
+Decision options:
+- REPLACE: New skill is clearly better (higher quality, more applicable, better performance)
+- SKIP: New skill is worse or redundant (keep existing, discard new)
+- MERGE: Skills are complementary (combine examples and contexts)
+
+Important: Consider that skills from different competitions may use different metrics (Log Loss vs Accuracy vs F1). Don't just compare success rates numerically.
+
+Respond with ONLY ONE WORD: REPLACE, SKIP, or MERGE"""
+
+        try:
+            response = APIBackend().build_messages_and_create_chat_completion(
+                user_prompt=prompt,
+                system_prompt="You are an ML expert. Compare skills intelligently considering different contexts and metrics.",
+                json_mode=False
+            )
+            decision = response.strip().upper()
+            # Validate response
+            if decision not in ["REPLACE", "SKIP", "MERGE"]:
+                logger.warning(f"Invalid LLM decision: {decision}, defaulting to MERGE")
+                return "MERGE"
+            return decision
+        except Exception as e:
+            logger.warning(f"LLM skill comparison failed: {e}, defaulting to MERGE")
+            return "MERGE"
+
     def add_or_update_skill(self, skill: Skill):
-        """
-        Add new skill or update existing similar skill.
+        """Add skill with LLM-based replace/merge/skip logic."""
 
-        If a similar skill exists (same name or very similar pattern),
-        merge them by adding the new example and updating stats.
-        """
-        # Check if skill with same name exists
-        existing_skill = self.skill_cache.get(skill.id)
+        # Find similar skill (by name)
+        similar_skill = None
+        for cached_skill in self.skill_cache.values():
+            if cached_skill.name == skill.name:
+                similar_skill = cached_skill
+                break
 
-        if not existing_skill:
-            # Check for skills with same name (different IDs)
-            for cached_skill in self.skill_cache.values():
-                if cached_skill.name == skill.name:
-                    existing_skill = cached_skill
-                    logger.info(f"Found existing skill with same name: {skill.name}")
-                    break
+        if similar_skill:
+            # Use LLM to decide: REPLACE, SKIP, or MERGE
+            decision = self._compare_skills(similar_skill, skill)
 
-        if existing_skill:
-            # Merge with existing skill
-            logger.info(f"Updating existing skill: {existing_skill.name}")
+            if decision == "REPLACE":
+                # Delete old, add new
+                logger.info(f"🔄 Replacing skill '{similar_skill.name}' with better version")
+                self.storage.delete_skill(similar_skill.id)
+                del self.skill_cache[similar_skill.id]
+                self.storage.save_skill(skill)
+                self.skill_cache[skill.id] = skill
 
-            # Add new examples
-            existing_skill.examples.extend(skill.examples)
+            elif decision == "SKIP":
+                # Don't add new skill
+                logger.info(f"⏭️  Skipping skill '{skill.name}' (keeping existing)")
 
-            # Update stats
-            existing_skill.success_count += skill.success_count
-            existing_skill.attempt_count += skill.attempt_count
+            else:  # MERGE
+                # Combine examples and contexts
+                logger.info(f"🔀 Merging skill '{skill.name}' with existing")
 
-            # Merge contexts (deduplicate)
-            for context in skill.applicable_contexts:
-                if context not in existing_skill.applicable_contexts:
-                    existing_skill.applicable_contexts.append(context)
+                similar_skill.examples.extend(skill.examples)
+                similar_skill.success_count += skill.success_count
+                similar_skill.attempt_count += skill.attempt_count
 
-            # Merge source competitions
-            for comp in skill.source_competitions:
-                if comp not in existing_skill.source_competitions:
-                    existing_skill.source_competitions.append(comp)
+                for context in skill.applicable_contexts:
+                    if context not in similar_skill.applicable_contexts:
+                        similar_skill.applicable_contexts.append(context)
 
-            # Increment version
-            existing_skill.version += 1
+                for comp in skill.source_competitions:
+                    if comp not in similar_skill.source_competitions:
+                        similar_skill.source_competitions.append(comp)
 
-            # Save updated skill
-            self.storage.save_skill(existing_skill)
-            self.skill_cache[existing_skill.id] = existing_skill
-
+                similar_skill.version += 1
+                self.storage.save_skill(similar_skill)
+                self.skill_cache[similar_skill.id] = similar_skill
         else:
             # Add new skill
-            logger.info(f"Adding new skill: {skill.name}")
+            logger.info(f"➕ Adding new skill: {skill.name}")
             self.storage.save_skill(skill)
             self.skill_cache[skill.id] = skill
 
@@ -287,55 +333,134 @@ class GlobalKnowledgeBase:
 
         return debug_skills
 
+    def _compare_debug_skills(self, existing: DebugSkill, new: DebugSkill) -> str:
+        """Use LLM to decide whether to REPLACE, SKIP, or MERGE debug skills."""
+        from rdagent.oai.llm_utils import APIBackend
+
+        prompt = f"""Compare these two debugging skills:
+
+EXISTING DEBUG SKILL:
+Name: {existing.name}
+Fix Success Rate: {existing.fix_success_rate():.1%} ({existing.fix_success_count}/{existing.detection_count} detections)
+Severity: {existing.severity}
+Symptom: {existing.symptom[:150]}...
+Solution: {existing.solution[:150]}...
+
+NEW DEBUG SKILL:
+Name: {new.name}
+Fix Success Rate: {new.fix_success_rate():.1%} ({new.fix_success_count}/{new.detection_count} detections)
+Severity: {new.severity}
+Symptom: {new.symptom[:150]}...
+Solution: {new.solution[:150]}...
+
+Should we REPLACE, SKIP, or MERGE?
+
+Respond with ONLY ONE WORD: REPLACE, SKIP, or MERGE"""
+
+        try:
+            response = APIBackend().build_messages_and_create_chat_completion(
+                user_prompt=prompt,
+                system_prompt="You are an ML expert. Compare debugging patterns intelligently.",
+                json_mode=False
+            )
+            decision = response.strip().upper()
+            if decision not in ["REPLACE", "SKIP", "MERGE"]:
+                logger.warning(f"Invalid LLM decision: {decision}, defaulting to MERGE")
+                return "MERGE"
+            return decision
+        except Exception as e:
+            logger.warning(f"LLM debug skill comparison failed: {e}, defaulting to MERGE")
+            return "MERGE"
+
+    def _is_similar_debug_skill_by_embedding(
+        self,
+        skill1: DebugSkill,
+        skill2: DebugSkill,
+        threshold: float = 0.85
+    ) -> bool:
+        """
+        Fast similarity check using embeddings before LLM comparison.
+
+        Compares symptom + solution text using embedding similarity.
+        This is much faster than LLM comparison and can be used for pre-filtering.
+
+        Args:
+            skill1: First debug skill
+            skill2: Second debug skill
+            threshold: Similarity threshold (0-1), default 0.85
+
+        Returns:
+            True if skills are similar (above threshold), False otherwise
+        """
+        try:
+            # Compare symptom + solution embeddings
+            text1 = f"{skill1.symptom} {skill1.solution}"
+            text2 = f"{skill2.symptom} {skill2.solution}"
+
+            similarity = self.matcher._cosine_similarity(
+                self.matcher._get_embedding(text1),
+                self.matcher._get_embedding(text2)
+            )
+            return similarity > threshold
+        except Exception as e:
+            logger.debug(f"Embedding similarity check failed: {e}")
+            # Fall back to name comparison
+            return skill1.name == skill2.name
+
     def add_or_update_debug_skill(self, debug_skill: DebugSkill):
-        """
-        Add new debug skill or update existing similar debug skill.
+        """Add debug skill with embedding pre-filter and LLM-based replace/merge/skip logic."""
 
-        If a similar debug skill exists (same name or symptom),
-        merge them by adding the new example and updating stats.
-        """
-        # Check if debug skill with same name exists
-        existing_skill = self.debug_skill_cache.get(debug_skill.id)
+        # Find similar debug skill - first by name, then by embedding similarity
+        similar_skill = None
 
-        if not existing_skill:
-            # Check for skills with same name (different IDs)
+        # First pass: exact name match
+        for cached_skill in self.debug_skill_cache.values():
+            if cached_skill.name == debug_skill.name:
+                similar_skill = cached_skill
+                break
+
+        # Second pass: if no name match, check embedding similarity
+        if similar_skill is None:
             for cached_skill in self.debug_skill_cache.values():
-                if cached_skill.name == debug_skill.name:
-                    existing_skill = cached_skill
-                    logger.info(f"Found existing debug skill with same name: {debug_skill.name}")
+                if self._is_similar_debug_skill_by_embedding(cached_skill, debug_skill, threshold=0.85):
+                    logger.info(f"📊 Found similar debug skill by embedding: '{cached_skill.name}' ≈ '{debug_skill.name}'")
+                    similar_skill = cached_skill
                     break
 
-        if existing_skill:
-            # Merge with existing debug skill
-            logger.info(f"Updating existing debug skill: {existing_skill.name}")
+        if similar_skill:
+            # Use LLM to decide: REPLACE, SKIP, or MERGE
+            decision = self._compare_debug_skills(similar_skill, debug_skill)
 
-            # Add new examples
-            existing_skill.examples.extend(debug_skill.examples)
+            if decision == "REPLACE":
+                logger.info(f"🔄 Replacing debug skill '{similar_skill.name}' with better version")
+                self.storage.delete_debug_skill(similar_skill.id)
+                del self.debug_skill_cache[similar_skill.id]
+                self.storage.save_debug_skill(debug_skill)
+                self.debug_skill_cache[debug_skill.id] = debug_skill
 
-            # Update stats
-            existing_skill.detection_count += debug_skill.detection_count
-            existing_skill.fix_success_count += debug_skill.fix_success_count
+            elif decision == "SKIP":
+                logger.info(f"⏭️  Skipping debug skill '{debug_skill.name}' (keeping existing)")
 
-            # Merge contexts (deduplicate)
-            for context in debug_skill.applicable_contexts:
-                if context not in existing_skill.applicable_contexts:
-                    existing_skill.applicable_contexts.append(context)
+            else:  # MERGE
+                logger.info(f"🔀 Merging debug skill '{debug_skill.name}' with existing")
 
-            # Merge source competitions
-            for comp in debug_skill.source_competitions:
-                if comp not in existing_skill.source_competitions:
-                    existing_skill.source_competitions.append(comp)
+                similar_skill.examples.extend(debug_skill.examples)
+                similar_skill.detection_count += debug_skill.detection_count
+                similar_skill.fix_success_count += debug_skill.fix_success_count
 
-            # Increment version
-            existing_skill.version += 1
+                for context in debug_skill.applicable_contexts:
+                    if context not in similar_skill.applicable_contexts:
+                        similar_skill.applicable_contexts.append(context)
 
-            # Save updated debug skill
-            self.storage.save_debug_skill(existing_skill)
-            self.debug_skill_cache[existing_skill.id] = existing_skill
+                for comp in debug_skill.source_competitions:
+                    if comp not in similar_skill.source_competitions:
+                        similar_skill.source_competitions.append(comp)
 
+                similar_skill.version += 1
+                self.storage.save_debug_skill(similar_skill)
+                self.debug_skill_cache[similar_skill.id] = similar_skill
         else:
-            # Add new debug skill
-            logger.info(f"Adding new debug skill: {debug_skill.name}")
+            logger.info(f"➕ Adding new debug skill: {debug_skill.name}")
             self.storage.save_debug_skill(debug_skill)
             self.debug_skill_cache[debug_skill.id] = debug_skill
 

@@ -71,6 +71,16 @@ class EnsembleMultiProcessEvolvingStrategy(MultiProcessEvolvingStrategy):
             queried_former_failed_knowledge[1],
         )
 
+        # Get relevant skills from global KB
+        relevant_skills = []
+        if queried_knowledge is not None:
+            relevant_skills = getattr(queried_knowledge, 'relevant_skills', {}).get(ensemble_information_str, [])
+
+        # Get relevant debug skills (failure patterns to avoid)
+        relevant_debug_skills = []
+        if queried_knowledge is not None:
+            relevant_debug_skills = getattr(queried_knowledge, 'relevant_debug_skills', {}).get(ensemble_information_str, [])
+
         # Generate code with knowledge integration
         competition_info = self.scen.get_scenario_all_desc(eda_output=workspace.file_dict.get("EDA.md", None))
         system_prompt = T(".prompts:ensemble_coder.system").r(
@@ -80,6 +90,8 @@ class EnsembleMultiProcessEvolvingStrategy(MultiProcessEvolvingStrategy):
             queried_former_failed_knowledge=(
                 queried_former_failed_knowledge[0] if queried_former_failed_knowledge else None
             ),
+            relevant_skills=relevant_skills,
+            relevant_debug_skills=relevant_debug_skills,
             all_code=workspace.all_codes,
             out_spec=PythonAgentOut.get_spec(),
         )

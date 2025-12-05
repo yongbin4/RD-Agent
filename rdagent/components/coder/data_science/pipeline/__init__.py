@@ -75,9 +75,21 @@ class PipelineMultiProcessEvolvingStrategy(MultiProcessEvolvingStrategy):
             queried_former_failed_knowledge[1],
         )
 
+        # Get relevant skills from global KB
+        relevant_skills = []
+        if queried_knowledge is not None:
+            relevant_skills = getattr(queried_knowledge, 'relevant_skills', {}).get(pipeline_task_info, [])
+
+        # Get relevant debug skills (failure patterns to avoid)
+        relevant_debug_skills = []
+        if queried_knowledge is not None:
+            relevant_debug_skills = getattr(queried_knowledge, 'relevant_debug_skills', {}).get(pipeline_task_info, [])
+
         system_prompt = T(".prompts:pipeline_coder.system").r(
             task_desc=pipeline_task_info,
             queried_former_failed_knowledge=queried_former_failed_knowledge[0],
+            relevant_skills=relevant_skills,
+            relevant_debug_skills=relevant_debug_skills,
             out_spec=PythonAgentOut.get_spec(),
             runtime_environment=self.scen.get_runtime_environment(),
             package_info=target_task.package_info,
@@ -135,6 +147,9 @@ class PipelineCoSTEER(DSCoSTEER):
         self,
         scen: Scenario,
         *args,
+        global_kb=None,
+        debug_skill_extractor=None,
+        competition_name: str = "",
         **kwargs,
     ) -> None:
         settings = DSCoderCoSTEERSettings()
@@ -161,5 +176,8 @@ class PipelineCoSTEER(DSCoSTEER):
             evolving_version=2,
             scen=scen,
             max_loop=DS_RD_SETTING.coder_max_loop,
+            global_kb=global_kb,
+            debug_skill_extractor=debug_skill_extractor,
+            competition_name=competition_name,
             **kwargs,
         )

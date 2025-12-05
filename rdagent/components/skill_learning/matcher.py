@@ -72,8 +72,16 @@ class SkillMatcher:
 
         candidates = []
         for skill in skill_library:
+            # Get success rate (support both Skill and DebugSkill)
+            if hasattr(skill, 'success_rate'):
+                rate = skill.success_rate()
+            elif hasattr(skill, 'fix_success_rate'):
+                rate = skill.fix_success_rate()
+            else:
+                rate = 0.5  # Default if no rate available
+
             # Filter by success rate
-            if skill.success_rate() < min_success_rate:
+            if rate < min_success_rate:
                 continue
 
             # Context matching (if provided)
@@ -92,7 +100,7 @@ class SkillMatcher:
             # Combined score: 40% similarity + 30% success_rate + 30% context_match
             score = (
                 0.4 * similarity +
-                0.3 * skill.success_rate() +
+                0.3 * rate +
                 0.3 * context_match_score
             )
 

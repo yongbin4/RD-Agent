@@ -58,6 +58,16 @@ class ModelMultiProcessEvolvingStrategy(MultiProcessEvolvingStrategy):
             queried_former_failed_knowledge[1],
         )
 
+        # Get relevant skills from global KB
+        relevant_skills = []
+        if queried_knowledge is not None:
+            relevant_skills = getattr(queried_knowledge, 'relevant_skills', {}).get(model_information_str, [])
+
+        # Get relevant debug skills (failure patterns to avoid)
+        relevant_debug_skills = []
+        if queried_knowledge is not None:
+            relevant_debug_skills = getattr(queried_knowledge, 'relevant_debug_skills', {}).get(model_information_str, [])
+
         # 2. code
         system_prompt = T(".prompts:model_coder.system").r(
             task_desc=model_information_str,
@@ -66,6 +76,8 @@ class ModelMultiProcessEvolvingStrategy(MultiProcessEvolvingStrategy):
             feature_code=workspace.file_dict["feature.py"],
             queried_similar_successful_knowledge=queried_similar_successful_knowledge,
             queried_former_failed_knowledge=queried_former_failed_knowledge[0],
+            relevant_skills=relevant_skills,
+            relevant_debug_skills=relevant_debug_skills,
             out_spec=PythonBatchEditOut.get_spec(),
         )
         # user_prompt = T(".prompts:model_coder.user").r(

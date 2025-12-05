@@ -5,6 +5,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional, Union
 
+import numpy as np
+import pandas as pd
+
 from rdagent.app.data_science.conf import DS_RD_SETTING
 from rdagent.components.coder.data_science.ensemble import EnsembleCoSTEER
 from rdagent.components.coder.data_science.ensemble.exp import EnsembleTask
@@ -117,11 +120,7 @@ class DataScienceRDLoop(RDLoop):
         self.ensemble_coder = EnsembleCoSTEER(scen)
         self.workflow_coder = WorkflowCoSTEER(scen)
 
-        self.pipeline_coder = PipelineCoSTEER(scen)
-
-        self.runner = DSCoSTEERRunner(scen)
-
-        # Initialize global knowledge base (skill learning - always enabled)
+        # Initialize global knowledge base FIRST (needed for coders)
         from rdagent.components.skill_learning.global_kb import GlobalKnowledgeBase
         from rdagent.components.skill_learning.extractor import SkillExtractor
         from rdagent.components.skill_learning.debug_extractor import DebugSkillExtractor
@@ -130,6 +129,16 @@ class DataScienceRDLoop(RDLoop):
         self.global_kb = GlobalKnowledgeBase()
         self.skill_extractor = SkillExtractor()
         self.debug_skill_extractor = DebugSkillExtractor()
+
+        # Initialize pipeline coder with global_kb for debug skill extraction from CoSTEER trace
+        self.pipeline_coder = PipelineCoSTEER(
+            scen,
+            global_kb=self.global_kb,
+            debug_skill_extractor=self.debug_skill_extractor,
+            competition_name=self.competition_name,
+        )
+
+        self.runner = DSCoSTEERRunner(scen)
 
         # Track recent experiments for failure pattern detection
         self.experiment_history = []  # List of (experiment, feedback) tuples
@@ -146,11 +155,19 @@ class DataScienceRDLoop(RDLoop):
         if stats['total_debug_skills'] > 0:
             logger.info(f"  - {stats['average_debug_skill_fix_rate']:.1%} average debug skill fix rate")
 
-        # Pass global KB to all coders
+        # Track best score for improvement-based extraction
+        self.best_score = None
+
+        # Pass global KB to all coders AND their evolving strategies
         for coder in [self.data_loader_coder, self.feature_coder, self.model_coder,
                       self.ensemble_coder, self.workflow_coder, self.pipeline_coder]:
             coder.global_kb = self.global_kb
             coder.competition_name = self.competition_name
+            coder.debug_skill_extractor = self.debug_skill_extractor
+            # Also propagate to evolving strategy so skills can be queried
+            if hasattr(coder, 'evolving_strategy'):
+                coder.evolving_strategy.global_kb = self.global_kb
+                coder.evolving_strategy.competition_name = self.competition_name
         if DS_RD_SETTING.enable_doc_dev:
             self.docdev = DocDev(scen)
 
@@ -192,7 +209,6 @@ class DataScienceRDLoop(RDLoop):
         # Fallback: extract from exp.result
         if score_raw is None and hasattr(exp, 'result') and exp.result is not None:
             try:
-                import pandas as pd
                 df = pd.DataFrame(exp.result)
                 if 'ensemble' in df.index:
                     score_raw = df.loc["ensemble"].iloc[0]
@@ -202,7 +218,6 @@ class DataScienceRDLoop(RDLoop):
         # Convert to float and validate
         if score_raw is not None:
             try:
-                import numpy as np
                 score = float(score_raw)
                 return not (np.isnan(score) or np.isinf(score))
             except (ValueError, TypeError):
@@ -265,70 +280,83 @@ class DataScienceRDLoop(RDLoop):
 
         return None
 
-    def _should_extract_skill_from_score(self, score: Optional[float]) -> tuple[bool, str]:
+    def _is_score_improved(self, old_score: float, new_score: float) -> tuple[bool, str]:
+        """Use LLM to determine if new_score improved over old_score."""
+        from rdagent.oai.llm_utils import APIBackend
+
+        # Validate metric info is available
+        if not hasattr(self.trace.scen, 'metric_name') or not self.trace.scen.metric_name:
+            logger.warning("Metric not configured, using fallback comparison")
+            # Fallback: assume lower is better (most common case)
+            improved = new_score < old_score
+            return improved, f"Fallback comparison (lower is better): {new_score} vs {old_score}"
+
+        metric_name = self.trace.scen.metric_name
+        metric_direction = self.trace.scen.metric_direction
+        brief_desc = self.trace.scen.brief_description
+
+        prompt = f"""Competition: {self.competition_name}
+Task: {brief_desc}
+
+Metric: {metric_name}
+Direction: {"Higher is better" if metric_direction else "Lower is better"}
+
+Previous score: {old_score:.6f}
+New score: {new_score:.6f}
+
+Question: Did the new score IMPROVE over the previous score?
+
+Respond with only "YES" or "NO" followed by a brief explanation (1 sentence)."""
+
+        try:
+            response = APIBackend().build_messages_and_create_chat_completion(
+                user_prompt=prompt,
+                system_prompt="You are an ML expert. Determine if a metric improved.",
+                json_mode=False
+            )
+            improved = response.strip().upper().startswith("YES")
+            return improved, response.strip()
+        except Exception as e:
+            logger.warning(f"LLM comparison failed: {e}, using fallback")
+            improved = new_score < old_score
+            return improved, f"Fallback (error): {e}"
+
+    def _should_extract_skill(self, score: Optional[float], feedback: Any) -> tuple[bool, str]:
+        """Determine if skills should be extracted using hybrid approach.
+
+        Hybrid logic:
+        - First successful experiment: Always extract (bootstrap KB)
+        - Subsequent: Extract if score improved AND acceptable
         """
-        Determine if skill should be extracted based on relative score quality.
-
-        For metrics where lower is better (like Log Loss):
-        - Extract if score is in the top X% (lowest X%)
-        - Bootstrap: always extract during first few experiments
-
-        Args:
-            score: The score of the current experiment (or None)
-
-        Returns:
-            (should_extract: bool, reason: str)
-        """
-        import numpy as np
-
-        # Edge case: Score is None - skip
         if score is None:
             return False, "Score is None"
 
-        # Get recent successful experiment scores from trace history
-        recent_scores = []
-        for exp, fb in self.trace.hist:
-            if hasattr(fb, 'decision'):
-                # Try to get score from feedback first
-                exp_score_raw = getattr(fb, 'score', None)
+        # Check acceptability from feedback
+        acceptable = getattr(feedback, 'acceptable', None)
+        decision = getattr(feedback, 'decision', None)
 
-                # Fallback: extract from exp.result if not in feedback
-                if exp_score_raw is None and hasattr(exp, 'result') and exp.result is not None:
-                    try:
-                        import pandas as pd
-                        df = pd.DataFrame(exp.result)
-                        if 'ensemble' in df.index:
-                            exp_score_raw = df.loc["ensemble"].iloc[0]
-                    except Exception:
-                        continue
+        # First success - always extract to bootstrap KB
+        if self.best_score is None:
+            self.best_score = score
+            return True, "First successful experiment - bootstrapping knowledge base"
 
-                # Convert to float and validate
-                if exp_score_raw is not None:
-                    try:
-                        exp_score = float(exp_score_raw)
-                        if not np.isnan(exp_score) and not np.isinf(exp_score):
-                            recent_scores.append(exp_score)
-                    except (ValueError, TypeError):
-                        continue
+        # Use LLM to check improvement
+        improved, llm_reason = self._is_score_improved(self.best_score, score)
 
-        # Bootstrap phase: not enough samples yet - always extract
-        min_samples = DS_RD_SETTING.skill_extraction_min_samples
-        if len(recent_scores) < min_samples:
-            return True, f"Bootstrapping: only {len(recent_scores)} samples (need {min_samples})"
+        if improved:
+            old_best = self.best_score
+            self.best_score = score
 
-        # Calculate percentile cutoff for "lower is better" metrics
-        percentile_threshold = DS_RD_SETTING.skill_extraction_percentile
-        cutoff = np.percentile(recent_scores, percentile_threshold)
+            # Extract if acceptable or decision is True
+            if acceptable is True or decision is True:
+                return True, f"Score improved ({old_best:.4f} → {score:.4f}) and experiment acceptable"
+            elif acceptable is None and decision is None:
+                # No feedback info - allow extraction based on score alone
+                return True, f"Score improved ({old_best:.4f} → {score:.4f})"
+            else:
+                return False, f"Score improved but experiment not acceptable (acceptable={acceptable}, decision={decision})"
 
-        # Lower scores are better, so extract if score <= cutoff
-        should_extract = score <= cutoff
-
-        reason = (
-            f"Score {score:.4f} {'<=' if should_extract else '>'} "
-            f"cutoff {cutoff:.4f} (top {percentile_threshold}% of {len(recent_scores)} samples)"
-        )
-
-        return should_extract, reason
+        return False, f"No improvement - {llm_reason}"
 
     async def direct_exp_gen(self, prev_out: dict[str, Any]):
 
@@ -409,6 +437,7 @@ class DataScienceRDLoop(RDLoop):
         cur_loop_id = prev_out[self.LOOP_IDX_KEY]
 
         e = prev_out.get(self.EXCEPTION_KEY, None)
+
         if e is None:
             exp = prev_out["running"]
 
@@ -422,14 +451,14 @@ class DataScienceRDLoop(RDLoop):
 
             # Skill learning: Extract skills from successful experiments
             feedback = prev_out["feedback"]
-            if hasattr(self, 'global_kb') and hasattr(feedback, 'decision'):
+
+            if hasattr(self, 'global_kb'):
                 # Try to get score from feedback first (DSRunnerFeedback has score attribute)
                 score_raw = getattr(feedback, 'score', None)
 
                 # Fallback: extract from exp.result if not in feedback (for HypothesisFeedback)
                 if score_raw is None and hasattr(exp, 'result') and exp.result is not None:
                     try:
-                        import pandas as pd
                         df = pd.DataFrame(exp.result)
                         if 'ensemble' in df.index:
                             score_raw = df.loc["ensemble"].iloc[0]
@@ -446,40 +475,85 @@ class DataScienceRDLoop(RDLoop):
                         logger.warning(f"Could not convert score to float: {score_raw}")
                         score = None
 
-                # Check if we should extract skills based on relative score quality
-                should_extract, reason = self._should_extract_skill_from_score(score)
+                # Check if we should extract skills based on hybrid approach
+                should_extract, reason = self._should_extract_skill(score, feedback)
+
+                logger.info(f"{'='*60}")
+                logger.info(f"🔍 SKILL EXTRACTION CHECK (Loop {cur_loop_id})")
+                logger.info(f"  Score: {score}")
+                logger.info(f"  Best Score: {self.best_score}")
+                logger.info(f"  Acceptable: {getattr(feedback, 'acceptable', None)}")
+                logger.info(f"  Decision: {getattr(feedback, 'decision', None)}")
+                logger.info(f"  Should Extract: {should_extract}")
+                logger.info(f"  Reason: {reason}")
+                logger.info(f"{'='*60}")
 
                 if should_extract:
                     logger.info(f"📊 Skill extraction triggered: {reason}")
                     try:
+                        logger.info(f"  Calling skill_extractor.extract_from_experiment...")
                         skills = self.skill_extractor.extract_from_experiment(
                             experiment=exp,
                             feedback=feedback,
-                            competition_context=self.competition_name
+                            competition_context=self.competition_name,
+                            score=score  # Pass the score we already extracted
                         )
-                        for skill in skills:
+                        logger.info(f"  Extracted {len(skills)} skill(s)")
+                        for i, skill in enumerate(skills):
+                            logger.info(f"  [{i+1}/{len(skills)}] Saving skill: {skill.name}")
+                            logger.info(f"    - Success rate: {skill.success_rate():.1%}")
+                            logger.info(f"    - Contexts: {skill.applicable_contexts}")
                             self.global_kb.add_or_update_skill(skill)
-                            logger.info(f"💡 Learned new skill: {skill.name}")
+                            logger.info(f"    ✅ Saved to global KB")
+                        logger.info(f"💡 Successfully learned {len(skills)} new skill(s)!")
                     except Exception as e:
-                        logger.error(f"Error extracting skills: {e}")
+                        logger.error(f"❌ Error extracting skills: {e}")
+                        import traceback
+                        logger.error(traceback.format_exc())
                 else:
                     logger.info(f"⏭️  Skipping skill extraction: {reason}")
 
+                # Track skill usage - check if any skill patterns appear in the generated code
+                try:
+                    all_skills = self.global_kb.load_all_skills()
+                    generated_code = str(exp.experiment_workspace.file_dict) if hasattr(exp, 'experiment_workspace') else ""
+                    experiment_successful = getattr(feedback, 'acceptable', False) or getattr(feedback, 'decision', False)
+
+                    for skill in all_skills:
+                        # Simple heuristic: check if first 50 chars of skill code appear in generated code
+                        if skill.code_pattern and len(skill.code_pattern) >= 50:
+                            pattern_prefix = skill.code_pattern[:50]
+                            if pattern_prefix in generated_code:
+                                self.global_kb.update_skill_usage(skill.id, success=experiment_successful)
+                                logger.info(f"📊 Updated usage stats for skill '{skill.name}': success={experiment_successful}")
+                except Exception as e:
+                    logger.debug(f"Could not track skill usage: {e}")
+
                 # Update SOTA if this is better than current best
-                # For metrics like Log Loss where lower is better, we compare appropriately
+                # Use LLM to handle both higher-is-better (Accuracy) and lower-is-better (Log Loss) metrics
                 if score is not None:
                     try:
                         current_best = self.global_kb.get_best_score(self.competition_name)
-                        is_better = current_best is None or score < current_best  # Lower is better for Log Loss
+
+                        # Use LLM to determine if score improved (handles metric direction)
+                        if current_best is None:
+                            is_better = True
+                        else:
+                            is_better, _ = self._is_score_improved(current_best, score)
 
                         if is_better:
                             from rdagent.components.experiment_learning.sota import SOTAModel
-                            # Determine rank (lower score = better rank)
+                            # Determine rank using LLM comparison
                             existing_sota = self.global_kb.get_sota(self.competition_name, top_k=3)
-                            rank = len([s for s in existing_sota if s.score <= score]) + 1
+                            rank = 1
+                            for s in existing_sota:
+                                # Check if existing SOTA is better than new score
+                                is_existing_better, _ = self._is_score_improved(score, s.score)
+                                if is_existing_better:
+                                    rank += 1
                             rank = min(rank, 3)  # Keep only top 3
 
-                            sota = SOTAModel.from_experiment(exp, feedback, rank=rank)
+                            sota = SOTAModel.from_experiment(exp, feedback, rank=rank, score=score)
                             sota.competition = self.competition_name
                             self.global_kb.save_sota(self.competition_name, sota)
                             logger.info(f"🏆 New SOTA for {self.competition_name}: rank {rank}, score {score:.6f}")
@@ -501,12 +575,21 @@ class DataScienceRDLoop(RDLoop):
                             # Extract from failure-success transition
                             failed_exp, failed_feedback = failed_data
                             success_exp, success_feedback = success_data
+                            # Extract scores from feedback
+                            before_score = None
+                            after_score = None
+                            if hasattr(failed_feedback, 'score') and failed_feedback.score is not None:
+                                before_score = float(failed_feedback.score)
+                            if hasattr(success_feedback, 'score') and success_feedback.score is not None:
+                                after_score = float(success_feedback.score)
                             debug_skill = self.debug_skill_extractor.extract_from_transition(
                                 failed_experiment=failed_exp,
                                 success_experiment=success_exp,
                                 failed_feedback=failed_feedback,
                                 success_feedback=success_feedback,
-                                competition_context=self.competition_name
+                                competition_context=self.competition_name,
+                                before_score=before_score,
+                                after_score=after_score
                             )
                         elif pattern_type == "error_fix":
                             # Extract from error fix
@@ -519,12 +602,21 @@ class DataScienceRDLoop(RDLoop):
                             # Extract from hypothesis evolution
                             failed_exp, failed_feedback = failed_data
                             success_exp, success_feedback = success_data
+                            # Extract scores from feedback
+                            before_score = None
+                            after_score = None
+                            if hasattr(failed_feedback, 'score') and failed_feedback.score is not None:
+                                before_score = float(failed_feedback.score)
+                            if hasattr(success_feedback, 'score') and success_feedback.score is not None:
+                                after_score = float(success_feedback.score)
                             debug_skill = self.debug_skill_extractor.extract_from_transition(
                                 failed_experiment=failed_exp,
                                 success_experiment=success_exp,
                                 failed_feedback=failed_feedback,
                                 success_feedback=success_feedback,
-                                competition_context=self.competition_name
+                                competition_context=self.competition_name,
+                                before_score=before_score,
+                                after_score=after_score
                             )
 
                         if debug_skill:
@@ -574,6 +666,52 @@ class DataScienceRDLoop(RDLoop):
                 max_history = DS_RD_SETTING.debug_skill_history_window
                 if len(self.experiment_history) > max_history:
                     self.experiment_history.pop(0)
+
+            # Skill learning: Extract skills even from failed experiments
+            if hasattr(self, 'global_kb'):
+                # Create feedback from exception for skill extraction
+                feedback = ExperimentFeedback.from_exception(e)
+
+                # Failed experiments don't have scores
+                score = None
+
+                # Check if we should extract skills based on hybrid approach
+                should_extract, reason = self._should_extract_skill(score, feedback)
+
+                logger.info(f"{'='*60}")
+                logger.info(f"🔍 SKILL EXTRACTION CHECK (Loop {cur_loop_id}) - FAILED EXPERIMENT")
+                logger.info(f"  Exception: {type(e).__name__}")
+                logger.info(f"  Score: {score}")
+                logger.info(f"  Best Score: {self.best_score}")
+                logger.info(f"  Should Extract: {should_extract}")
+                logger.info(f"  Reason: {reason}")
+                logger.info(f"{'='*60}")
+
+                if should_extract:
+                    logger.info(f"📊 Skill extraction triggered from failed experiment: {reason}")
+                    try:
+                        logger.info(f"  Calling skill_extractor.extract_from_experiment...")
+                        skills = self.skill_extractor.extract_from_experiment(
+                            experiment=exp,
+                            feedback=feedback,
+                            competition_context=self.competition_name,
+                            score=score  # Pass the score (None for failed experiments)
+                        )
+                        logger.info(f"  Extracted {len(skills)} skill(s) from failed experiment")
+
+                        for i, skill in enumerate(skills):
+                            logger.info(f"  [{i+1}/{len(skills)}] Saving skill: {skill.name}")
+                            self.global_kb.add_or_update_skill(skill)
+                            logger.info(f"    ✅ Saved to global KB")
+
+                        if len(skills) > 0:
+                            logger.info(f"💡 Successfully learned {len(skills)} new skill(s) from failed experiment!")
+                    except Exception as skill_error:
+                        logger.error(f"❌ Error extracting skills from failed experiment: {skill_error}")
+                        import traceback
+                        logger.error(traceback.format_exc())
+                else:
+                    logger.info(f"⏭️  Skipping skill extraction from failed experiment: {reason}")
 
             if self.trace.sota_experiment() is None:
                 if DS_RD_SETTING.coder_on_whole_pipeline:
