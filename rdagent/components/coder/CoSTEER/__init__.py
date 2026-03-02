@@ -177,22 +177,31 @@ class CoSTEER(Developer[Experiment]):
         Analyzes the evolving_trace for failure→success transitions at the task level.
         When code fails and is subsequently fixed, this represents a valuable debug pattern.
         """
-        logger.debug(f"_extract_debug_skills_from_trace called: global_kb={self.global_kb is not None}, extractor={self.debug_skill_extractor is not None}")
+        logger.info(f"[DEBUG_SKILL] _extract_debug_skills_from_trace called: global_kb={self.global_kb is not None}, extractor={self.debug_skill_extractor is not None}")
 
         if self.global_kb is None or self.debug_skill_extractor is None:
-            logger.debug("Skipping debug skill extraction: global_kb or debug_skill_extractor is None")
+            logger.info("[DEBUG_SKILL] Skipping debug skill extraction: global_kb or debug_skill_extractor is None")
             return
 
         if not hasattr(self, 'evolve_agent') or not hasattr(self.evolve_agent, 'evolving_trace'):
-            logger.debug("Skipping debug skill extraction: no evolve_agent or evolving_trace")
+            logger.info("[DEBUG_SKILL] Skipping debug skill extraction: no evolve_agent or evolving_trace")
             return
 
         evolving_trace = self.evolve_agent.evolving_trace
         if len(evolving_trace) < 2:
-            logger.debug(f"Skipping debug skill extraction: only {len(evolving_trace)} steps (need >= 2)")
+            logger.info(f"[DEBUG_SKILL] Skipping debug skill extraction: only {len(evolving_trace)} steps (need >= 2)")
             return
 
         logger.info(f"🔍 Analyzing {len(evolving_trace)} evo steps for debug skill extraction...")
+
+        # Log summary of each step's execution status for debugging
+        for i, step in enumerate(evolving_trace):
+            fb = step.feedback
+            if fb is not None:
+                exec_str = str(getattr(fb, 'execution', ''))[:100]
+                is_acc = fb.is_acceptable() if hasattr(fb, 'is_acceptable') else 'N/A'
+                crashed = 'did NOT execute' in exec_str or 'Code failed' in exec_str
+                logger.info(f"[DEBUG_SKILL] Step {i}: is_acceptable={is_acc}, crashed={crashed}, exec_preview={exec_str[:50]}...")
 
         extracted_count = 0
         transitions_found = 0
@@ -204,41 +213,51 @@ class CoSTEER(Developer[Experiment]):
             curr_fb = curr_step.feedback
 
             if prev_fb is None or curr_fb is None:
-                logger.debug(f"Step {i}: feedback is None (prev={prev_fb is not None}, curr={curr_fb is not None})")
+                logger.info(f"[DEBUG_SKILL] Step {i}: feedback is None (prev={prev_fb is not None}, curr={curr_fb is not None})")
                 continue
 
             # For PipelineTask, feedback is a single item (not multi-feedback)
             # For component-based tasks, feedback is CoSTEERMultiFeedback
             if isinstance(curr_fb, CoSTEERMultiFeedback):
-                # Check each sub-task for failure→success
+                # Check each sub-task for failure→success using LLM
                 for task_idx in range(len(curr_fb)):
                     prev_task_fb = prev_fb[task_idx] if task_idx < len(prev_fb) else None
                     curr_task_fb = curr_fb[task_idx]
 
                     if prev_task_fb and curr_task_fb:
-                        prev_failed = not prev_task_fb.is_acceptable()
-                        curr_succeeded = curr_task_fb.is_acceptable()
+                        # Get code for this task
+                        prev_code = self._get_workspace_code(prev_step.evolvable_subjects, task_idx)
+                        curr_code = self._get_workspace_code(curr_step.evolvable_subjects, task_idx)
 
-                        logger.debug(f"Step {i}, task {task_idx}: prev_failed={prev_failed}, curr_succeeded={curr_succeeded}")
+                        # Use LLM to decide if this is a worthy transition
+                        is_worthy, reason = self._is_debug_skill_worthy_transition(
+                            prev_task_fb, curr_task_fb, prev_code, curr_code
+                        )
 
-                        if prev_failed and curr_succeeded:
+                        logger.info(f"[DEBUG_SKILL] Step {i}, task {task_idx}: LLM decision={is_worthy}, reason={reason[:100] if reason else 'N/A'}")
+
+                        if is_worthy:
                             transitions_found += 1
-                            logger.info(f"🎯 Found failure→success transition at step {i}, task {task_idx}")
+                            logger.info(f"🎯 Found worthy debug skill transition at step {i}, task {task_idx}: {reason[:50] if reason else 'N/A'}")
                             debug_skill = self._extract_single_debug_skill(
                                 prev_step, curr_step, task_idx
                             )
                             if debug_skill:
                                 extracted_count += 1
             else:
-                # Single task feedback (e.g., PipelineTask)
-                prev_failed = not prev_fb.is_acceptable() if hasattr(prev_fb, 'is_acceptable') else False
-                curr_succeeded = curr_fb.is_acceptable() if hasattr(curr_fb, 'is_acceptable') else False
+                # Single task feedback (e.g., PipelineTask) - use LLM-based detection
+                prev_code = self._get_workspace_code(prev_step.evolvable_subjects, 0)
+                curr_code = self._get_workspace_code(curr_step.evolvable_subjects, 0)
 
-                logger.debug(f"Step {i} (single): prev_failed={prev_failed}, curr_succeeded={curr_succeeded}, fb_type={type(curr_fb).__name__}")
+                is_worthy, reason = self._is_debug_skill_worthy_transition(
+                    prev_fb, curr_fb, prev_code, curr_code
+                )
 
-                if prev_failed and curr_succeeded:
+                logger.info(f"[DEBUG_SKILL] Step {i} (single): LLM decision={is_worthy}, reason={reason[:100] if reason else 'N/A'}, fb_type={type(curr_fb).__name__}")
+
+                if is_worthy:
                     transitions_found += 1
-                    logger.info(f"🎯 Found failure→success transition at step {i}")
+                    logger.info(f"🎯 Found worthy debug skill transition at step {i}: {reason[:50] if reason else 'N/A'}")
                     debug_skill = self._extract_single_debug_skill(
                         prev_step, curr_step, task_idx=0
                     )
@@ -341,6 +360,115 @@ class CoSTEER(Developer[Experiment]):
         except Exception:
             pass
         return {}
+
+    def _is_debug_skill_worthy_transition(
+        self,
+        prev_fb,
+        curr_fb,
+        prev_code: dict,
+        curr_code: dict
+    ) -> tuple[bool, str]:
+        """
+        Use LLM to determine if this transition represents a valuable debug skill.
+
+        Args:
+            prev_fb: Feedback from previous step
+            curr_fb: Feedback from current step
+            prev_code: Code dictionary from previous step
+            curr_code: Code dictionary from current step
+
+        Returns:
+            Tuple of (should_extract: bool, reason: str)
+        """
+        from rdagent.oai.llm_utils import APIBackend
+
+        if prev_fb is None or curr_fb is None:
+            return False, "Missing feedback"
+
+        # PRIORITY 1: Check for CRASH→RUNS transition based on execution feedback content
+        # This is more robust than checking is_acceptable() because code might run but still be unacceptable
+        prev_execution = str(getattr(prev_fb, 'execution', ''))
+        curr_execution = str(getattr(curr_fb, 'execution', ''))
+
+        prev_crashed = (
+            'did NOT execute' in prev_execution or
+            'Code failed' in prev_execution or
+            ('Traceback' in prev_execution and 'executed successfully' not in prev_execution.lower())
+        )
+        curr_runs = (
+            'executed to completion' in curr_execution.lower() or
+            'executed successfully' in curr_execution.lower() or
+            ('did NOT execute' not in curr_execution and 'Code failed' not in curr_execution)
+        )
+
+        if prev_crashed and curr_runs:
+            logger.info(f"[DEBUG_SKILL] Detected CRASH→RUNS transition: prev_crashed={prev_crashed}, curr_runs={curr_runs}")
+            return True, f"CRASH→RUNS: Code went from crashing to running (valuable debugging pattern)"
+
+        # Format feedback info for LLM check
+        prev_info = f"""
+    Execution: {str(getattr(prev_fb, 'execution', 'N/A'))[:500]}
+    Return Check: {str(getattr(prev_fb, 'return_checking', 'N/A'))[:300]}
+    Code Feedback: {str(getattr(prev_fb, 'code', 'N/A'))[:300]}
+    Score: {getattr(prev_fb, 'score', 'N/A')}
+    Acceptable: {getattr(prev_fb, 'acceptable', 'N/A')}
+    """
+
+        curr_info = f"""
+    Execution: {str(getattr(curr_fb, 'execution', 'N/A'))[:500]}
+    Return Check: {str(getattr(curr_fb, 'return_checking', 'N/A'))[:300]}
+    Code Feedback: {str(getattr(curr_fb, 'code', 'N/A'))[:300]}
+    Score: {getattr(curr_fb, 'score', 'N/A')}
+    Acceptable: {getattr(curr_fb, 'acceptable', 'N/A')}
+    """
+
+        # Get code changes
+        prev_code_str = "\n".join([f"# {k}\n{v[:500]}" for k, v in prev_code.items()])
+        curr_code_str = "\n".join([f"# {k}\n{v[:500]}" for k, v in curr_code.items()])
+
+        prompt = f"""Analyze this code transition and determine if it represents a valuable debugging pattern worth learning.
+
+## Previous Step Feedback:
+{prev_info}
+
+## Current Step Feedback:
+{curr_info}
+
+## Previous Code (snippet):
+{prev_code_str[:1000]}
+
+## Current Code (snippet):
+{curr_code_str[:1000]}
+
+## Question:
+Does this transition represent a FAILURE-TO-SUCCESS pattern that would be valuable to extract as a reusable debugging skill?
+
+Criteria for "YES":
+1. Previous step had a meaningful error, bug, or failure (not just minor issues)
+2. Current step successfully fixed the problem
+3. The fix represents a pattern that could help avoid similar issues in the future
+4. The error is NOT trivial (not just syntax errors, typos, or missing imports)
+
+Respond with ONLY "YES" or "NO" followed by a brief reason (1 sentence).
+"""
+
+        try:
+            response = APIBackend().build_messages_and_create_chat_completion(
+                user_prompt=prompt,
+                system_prompt="You are an expert at identifying valuable debugging patterns in code. Be selective - only say YES for meaningful failure-to-success transitions.",
+                json_mode=False,
+            )
+            is_worthy = response.strip().upper().startswith("YES")
+            return is_worthy, response.strip()
+        except Exception as e:
+            logger.warning(f"LLM transition check failed: {e}")
+            # Fallback 1: Check CRASH→RUNS again (in case we missed it earlier)
+            if prev_crashed and curr_runs:
+                return True, f"Fallback CRASH→RUNS: Code went from crashing to running"
+            # Fallback 2: Simple is_acceptable check
+            prev_failed = getattr(prev_fb, 'acceptable', None) is False or getattr(prev_fb, 'final_decision', None) is False
+            curr_good = getattr(curr_fb, 'acceptable', None) is True or getattr(curr_fb, 'final_decision', None) is True
+            return prev_failed and curr_good, f"Fallback: prev_failed={prev_failed}, curr_good={curr_good}"
 
     def _exp_postprocess_by_feedback(self, evo: Experiment, feedback: CoSTEERMultiFeedback) -> Experiment:
         """

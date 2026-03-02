@@ -136,33 +136,58 @@ Our debug skill learning differs by extracting *generalizable patterns* from spe
 │  │   Proposal   │───▶│    Coding    │───▶│   Running    │───▶│  Feedback  │ │
 │  │  Generation  │    │   (Coders)   │    │   (Runner)   │    │ (Evaluator)│ │
 │  └──────────────┘    └──────────────┘    └──────────────┘    └────────────┘ │
-│         │                   ▲                                      │        │
-│         │            ┌──────┴───────┐                              │        │
-│         │            │  Skill-Aware │                              │        │
-│         │            │    Prompts   │                              │        │
-│         │            └──────────────┘                              │        │
-│         │                   ▲                                      ▼        │
-│         │            ┌──────┴───────┐                      ┌───────────────┐│
-│         │            │   Retrieval  │◀─────────────────────│    Record     ││
-│         │            │   (Matcher)  │                      │  (Learning)   ││
-│         │            └──────────────┘                      └───────────────┘│
-│         │                   ▲                                      │        │
-│         │            ┌──────┴───────────────────────────────────────┐       │
-│         └───────────▶│         Global Knowledge Base                │       │
-│                      │  ┌─────────┐ ┌─────────────┐ ┌────────────┐  │       │
-│                      │  │  Skills │ │Debug Skills │ │    SOTA    │  │       │
-│                      │  │ Library │ │   Library   │ │   Models   │  │       │
-│                      │  └─────────┘ └─────────────┘ └────────────┘  │       │
-│                      └──────────────────────────────────────────────┘       │
-│                                        │                                    │
-└────────────────────────────────────────┼────────────────────────────────────┘
-                                         │
-                                         ▼
-                          ┌──────────────────────────────┐
-                          │  ~/.rdagent/global_knowledge │
-                          │       (Persistent Storage)   │
-                          └──────────────────────────────┘
+│      [EXISTING]         [EXISTING]          [EXISTING]         [EXISTING]   │
+│                             ▲                                      │        │
+│                      ╔══════╧═══════╗                              │        │
+│                      ║  Skill-Aware ║                              │        │
+│                      ║    Prompts   ║                              │        │
+│                      ╚══════════════╝                              │        │
+│                          [NEW]                                     ▼        │
+│                             ▲                              ╔═══════════════╗│
+│                      ╔══════╧═══════╗                      ║    Record     ║│
+│                      ║   Retrieval  ║                      ║  (Learning)   ║│
+│                      ║   (Matcher)  ║                      ╚═══════════════╝│
+│                      ╚══════════════╝                          [NEW]        │
+│                          [NEW]                                     │        │
+│                             ▲                                      │        │
+│                             │ READ                           WRITE │        │
+│                      ╔══════╧══════════════════════════════════════╧══╗     │
+│                      ║           Global Knowledge Base                ║     │
+│                      ║  ┌─────────┐ ┌─────────────┐ ┌────────────┐    ║     │
+│                      ║  │  Skills │ │Debug Skills │ │    SOTA    │    ║     │
+│                      ║  │ Library │ │   Library   │ │   Models   │    ║     │
+│                      ║  └─────────┘ └─────────────┘ └────────────┘    ║     │
+│                      ╚════════════════════════════════════════════════╝     │
+│                                       [NEW]                                 │
+│                                           │                                 │
+└───────────────────────────────────────────┼─────────────────────────────────┘
+                                            │
+                                            ▼
+                          ╔══════════════════════════════╗
+                          ║  ~/.rdagent/global_knowledge ║
+                          ║       (Persistent Storage)   ║
+                          ╚══════════════════════════════╝
+                                       [NEW]
 ```
+
+**Legend:**
+- `┌───┐` Single-line boxes = **EXISTING** RD-Agent components
+- `╔═══╗` Double-line boxes = **NEW** Skill Learning components (our contribution)
+
+**Data Flow:**
+1. **Coding** requests relevant skills via **Retrieval** (READ from KB)
+2. **Retrieval** injects skills into **Skill-Aware Prompts** for code generation
+3. **Feedback** triggers **Record** to extract new skills from successful experiments
+4. **Record** saves extracted skills to **Global Knowledge Base** (WRITE to KB)
+
+**New Components Added:**
+| Component | Purpose |
+|-----------|---------|
+| Skill-Aware Prompts | Injects retrieved skills into code generation prompts |
+| Retrieval (Matcher) | Semantic search for relevant skills using hybrid scoring |
+| Record (Learning) | Extracts skills from successful experiments |
+| Global Knowledge Base | Stores skills, debug skills, and SOTA models |
+| Persistent Storage | Disk-based storage at `~/.rdagent/global_knowledge/` |
 
 ### 3.2 Component Overview
 

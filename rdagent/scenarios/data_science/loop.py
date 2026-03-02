@@ -201,7 +201,19 @@ class DataScienceRDLoop(RDLoop):
         Check if experiment completed successfully with a valid score.
 
         Returns True if the experiment produced a valid numeric score,
-        regardless of whether it beat SOTA.
+        regardless of whether it beat SOTA. This indicates the code ran successfully.
+        """
+        score = self._get_score(exp, feedback)
+        return score is not None
+
+    def _get_score(self, exp, feedback) -> Optional[float]:
+        """
+        Extract numeric score from experiment or feedback.
+
+        Tries multiple sources in order:
+        1. feedback.score attribute (DSRunnerFeedback has this)
+        2. exp.result DataFrame
+        3. scores.csv from workspace path (fallback when result was cleared)
         """
         # Try to get score from feedback first
         score_raw = getattr(feedback, 'score', None)
@@ -215,15 +227,33 @@ class DataScienceRDLoop(RDLoop):
             except Exception:
                 pass
 
+        # Fallback: try reading from workspace scores.csv
+        # This handles cases where exp.result was cleared by feedback
+        if score_raw is None and hasattr(exp, 'experiment_workspace'):
+            try:
+                ws = exp.experiment_workspace
+                if hasattr(ws, 'workspace_path') and ws.workspace_path:
+                    score_path = ws.workspace_path / "scores.csv"
+                    if score_path.exists():
+                        df = pd.read_csv(score_path, index_col=0)
+                        if 'ensemble' in df.index:
+                            score_raw = df.loc["ensemble"].iloc[0]
+                        elif len(df) > 0:
+                            # Take last available score
+                            score_raw = df.iloc[-1, 0]
+            except Exception:
+                pass
+
         # Convert to float and validate
         if score_raw is not None:
             try:
                 score = float(score_raw)
-                return not (np.isnan(score) or np.isinf(score))
+                if not (np.isnan(score) or np.isinf(score)):
+                    return score
             except (ValueError, TypeError):
                 pass
 
-        return False
+        return None
 
     def _detect_failure_patterns(self, current_exp, current_feedback) -> Optional[tuple[str, any, any]]:
         """
@@ -233,14 +263,31 @@ class DataScienceRDLoop(RDLoop):
             Tuple of (pattern_type, failed_exp/feedback, success_exp/feedback) if pattern found, None otherwise
             pattern_type: "consecutive", "error_fix", or "hypothesis_evolution"
         """
+        # Log for debugging
+        current_score = self._get_score(current_exp, current_feedback)
+        logger.info(f"[DEBUG_SKILL] Pattern detection called - current_score={current_score}, history_len={len(self.experiment_history)}")
+
+        # Also log to file
+        import os
+        debug_log_path = os.path.expanduser("~/.rdagent/debug_skill_extraction.log")
+        with open(debug_log_path, "a") as f:
+            f.write(f"  current_score={current_score}, history_len={len(self.experiment_history)}\n")
+
         # Pattern 1: Consecutive experiments (failed → succeeded)
         # Check if previous experiment failed and current one succeeded
         if len(self.experiment_history) >= 1:
             prev_exp, prev_feedback = self.experiment_history[-1]
+            prev_score = self._get_score(prev_exp, prev_feedback)
 
             # Check if current succeeded and previous failed
             current_success = self._has_valid_score(current_exp, current_feedback)
             prev_failed = not self._has_valid_score(prev_exp, prev_feedback)
+
+            logger.info(f"[DEBUG_SKILL] Pattern 1: prev_score={prev_score}, prev_failed={prev_failed}, current_score={current_score}, current_success={current_success}")
+
+            # Log to file
+            with open(debug_log_path, "a") as f:
+                f.write(f"  Pattern 1: prev_score={prev_score}, prev_failed={prev_failed}, current_score={current_score}, current_success={current_success}\n")
 
             if current_success and prev_failed:
                 logger.info("🔍 Detected consecutive failure→success pattern")
@@ -561,10 +608,34 @@ Respond with only "YES" or "NO" followed by a brief explanation (1 sentence)."""
                         logger.error(f"Error saving SOTA: {e}")
 
             # Debug skill learning: Extract problem-solving patterns from failures
+            # Also log to file for debugging
+            import os
+            debug_log_path = os.path.expanduser("~/.rdagent/debug_skill_extraction.log")
+            os.makedirs(os.path.dirname(debug_log_path), exist_ok=True)
+            with open(debug_log_path, "a") as f:
+                from datetime import datetime
+                f.write(f"\n{'='*60}\n")
+                f.write(f"[{datetime.now()}] Loop {cur_loop_id} - Debug Skill Extraction Check\n")
+                f.write(f"enable_debug_skill_extraction={DS_RD_SETTING.enable_debug_skill_extraction}\n")
+                f.write(f"has debug_skill_extractor={hasattr(self, 'debug_skill_extractor')}\n")
+                f.write(f"has global_kb={hasattr(self, 'global_kb')}\n")
+                f.write(f"experiment_history length={len(self.experiment_history)}\n")
+
+            logger.info(f"[DEBUG_SKILL] === Debug Skill Extraction Check ===")
+            logger.info(f"[DEBUG_SKILL] enable_debug_skill_extraction={DS_RD_SETTING.enable_debug_skill_extraction}")
+            logger.info(f"[DEBUG_SKILL] has debug_skill_extractor={hasattr(self, 'debug_skill_extractor')}")
+            logger.info(f"[DEBUG_SKILL] has global_kb={hasattr(self, 'global_kb')}")
+
             if DS_RD_SETTING.enable_debug_skill_extraction and hasattr(self, 'debug_skill_extractor') and hasattr(self, 'global_kb'):
                 try:
                     # Detect failure patterns
+                    logger.info(f"[DEBUG_SKILL] Calling _detect_failure_patterns...")
                     pattern = self._detect_failure_patterns(exp, feedback)
+                    logger.info(f"[DEBUG_SKILL] Pattern result: {pattern[0] if pattern else None}")
+
+                    # Log to file
+                    with open(debug_log_path, "a") as f:
+                        f.write(f"Pattern result: {pattern[0] if pattern else None}\n")
 
                     if pattern:
                         pattern_type, failed_data, success_data = pattern
@@ -622,8 +693,16 @@ Respond with only "YES" or "NO" followed by a brief explanation (1 sentence)."""
                         if debug_skill:
                             self.global_kb.add_or_update_debug_skill(debug_skill)
                             logger.info(f"🔧 Learned debug skill: {debug_skill.name} (severity: {debug_skill.severity})")
+                        else:
+                            logger.info(f"[DEBUG_SKILL] Extractor returned None for {pattern_type} pattern")
+                    else:
+                        logger.info(f"[DEBUG_SKILL] No pattern detected - experiment_history has {len(self.experiment_history)} items")
                 except Exception as e:
                     logger.error(f"Error extracting debug skill: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+            else:
+                logger.info(f"[DEBUG_SKILL] Skipped: enable={DS_RD_SETTING.enable_debug_skill_extraction}, extractor={hasattr(self, 'debug_skill_extractor')}, kb={hasattr(self, 'global_kb')}")
 
             # Add to experiment history (keep last N experiments based on config)
             if hasattr(self, 'experiment_history'):
