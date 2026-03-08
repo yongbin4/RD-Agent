@@ -10,7 +10,7 @@ from rdagent.oai.llm_utils import APIBackend
 logger = logging.getLogger(__name__)
 
 
-DEBUG_SKILL_EXTRACTION_PROMPT = """Analyze this failure-to-success transition and extract a problem-solving pattern (debug skill).
+DEBUG_SKILL_EXTRACTION_PROMPT = """AnalWyze this failure-to-success transition and extract a problem-solving pattern (debug skill).
 
 ## Context
 Competition: {competition}
